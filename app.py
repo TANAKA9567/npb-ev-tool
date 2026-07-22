@@ -37,6 +37,12 @@ TEAM_ALIASES = {
 
 # TEAM_ALIASESは正式ルールとして固定し、画像OCR特有の崩れだけをこちらで補正する。
 OCR_TEAM_ALIASES = {
+    "東京アクルトスワローズ": "ヤクルト",
+    "アクルトスワローズ": "ヤクルト",
+    "アクルト": "ヤクルト",
+    "中目ドラゴンズ": "中日",
+    "中ロドラゴンズ": "中日",
+    "中日ドラゴン": "中日",
     "ゴールデンイーグルス": "楽天",
     "ゴオールデンイーグルス": "楽天",
     "東北楽天": "楽天",
@@ -154,22 +160,48 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
         return [{k: v for k, v in row.items() if not k.startswith("_ocr_")} for row in found]
     merged = [dict(row) for row in existing]
     for detected in found:
-        detected_pair = {norm_team(detected["チーム1"]), norm_team(detected["チーム2"])}
-        match = next((row for row in merged if
-                      {norm_team(row.get("チーム1", "")), norm_team(row.get("チーム2", ""))} == detected_pair), None)
+        detected_team1 = norm_team(detected.get("チーム1", ""))
+        detected_team2 = norm_team(detected.get("チーム2", ""))
+        known_teams = {team for team in (detected_team1, detected_team2) if team}
+        candidates = [row for row in merged if known_teams and known_teams.issubset({
+            norm_team(row.get("チーム1", "")), norm_team(row.get("チーム2", ""))
+        })]
+        match = candidates[0] if len(candidates) == 1 else None
         if match is None:
-            merged.append({k: v for k, v in detected.items() if not k.startswith("_ocr_")})
+            # 貼り付け表がある場合、OCRだけで推測した不明な組み合わせは追加しない。
             continue
-        if norm_team(match["チーム1"]) == norm_team(detected["チーム1"]):
+        # 上側または下側の片方だけ読めた場合も、画像内の位置から向きを確定する。
+        if detected_team1:
+            same_order = norm_team(match["チーム1"]) == detected_team1
+        else:
+            same_order = norm_team(match["チーム2"]) == detected_team2
+        if same_order:
             match["オッズ1"], match["オッズ2"] = detected["オッズ1"], detected["オッズ2"]
         else:
             match["オッズ1"], match["オッズ2"] = detected["オッズ2"], detected["オッズ1"]
         giver = norm_team(match.get("出しチーム", ""))
         hcap = parse_handicap(str(match.get("ハンデ", "0")))
+        favorite_slot = detected.get("_ocr_2plus_slot")
+        if favorite_slot in (1, 2):
+            favorite_is_match_team1 = (favorite_slot == 1) if same_order else (favorite_slot == 2)
+            detected_favorite = norm_team(match["チーム1"] if favorite_is_match_team1 else match["チーム2"])
+        else:
+            detected_favorite = norm_team(detected.get("_ocr_2plus_team", ""))
+        detected_2plus_pct = detected.get("_ocr_2plus_pct")
+        if detected_2plus_pct is not None and detected_favorite:
+            match_team1 = norm_team(match["チーム1"])
+            match_team2 = norm_team(match["チーム2"])
+            p_match_team1 = fair_probability(float(match["オッズ1"]), float(match["オッズ2"]))
+            p_detected_ml = p_match_team1 if detected_favorite == match_team1 else 1 - p_match_team1
+            # 2点差以上勝率が通常勝率を超える場合は、+1.5側を-1.5側と
+            # 取り違えているため、反対チームと補確率へ直す。
+            if float(detected_2plus_pct) / 100 > p_detected_ml + 0.005:
+                detected_favorite = match_team2 if detected_favorite == match_team1 else match_team1
+                detected_2plus_pct = 100 - float(detected_2plus_pct)
         if (abs(hcap) > 1e-9
-                and giver == norm_team(detected.get("_ocr_2plus_team", ""))
-                and detected.get("_ocr_2plus_pct") is not None):
-            match["出し2点差以上(%)"] = round(float(detected["_ocr_2plus_pct"]), 2)
+                and giver == detected_favorite
+                and detected_2plus_pct is not None):
+            match["出し2点差以上(%)"] = round(float(detected_2plus_pct), 2)
     # チーム文字が崩れても、貼り付け表と画像の試合数が同じなら上から順に補完する。
     if ordered_numeric and len(ordered_numeric) == len(merged):
         for row, values in zip(merged, ordered_numeric):
@@ -187,7 +219,11 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
                     probability = fair_probability(values[2], values[3]) * 100
                 else:
                     probability = fair_probability(values[3], values[2]) * 100
-                row["出し2点差以上(%)"] = round(probability, 2)
+                favorite_ml_probability = (fair_probability(values[0], values[1])
+                                           if favorite == team1
+                                           else fair_probability(values[1], values[0])) * 100
+                if probability <= favorite_ml_probability + 0.5:
+                    row["出し2点差以上(%)"] = round(probability, 2)
     return merged
 
 
@@ -340,6 +376,61 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                           "出し2点差以上(%)": None,
                           "_ocr_2plus_team": two_plus_team,
                           "_ocr_2plus_pct": two_plus_pct})
+
+    # PC版も数字の横一列を1試合として扱う。全体のチーム名読み順が一部欠けても、
+    # 同じ高さのブロックで片方を認識できれば貼り付け対戦カードから相手を補完できる。
+    desktop_coordinate_detected = []
+    if not is_mobile_layout and numeric_groups:
+        group_centers = [sum(item["y"] for item in group) / len(group) for group in numeric_groups]
+        for group_index, group in enumerate(numeric_groups):
+            center = group_centers[group_index]
+            if group_index == 0:
+                low = center - (group_centers[1] - center) / 2 if len(group_centers) > 1 else center - 50 * scale
+            else:
+                low = (group_centers[group_index - 1] + center) / 2
+            if group_index == len(group_centers) - 1:
+                high = center + (center - group_centers[group_index - 1]) / 2 if group_index else center + 50 * scale
+            else:
+                high = (center + group_centers[group_index + 1]) / 2
+
+            nearby = []
+            for team_item in teams:
+                if low <= team_item["y"] < high and team_item["team"] not in [item["team"] for item in nearby]:
+                    nearby.append(team_item)
+            nearby = sorted(nearby, key=lambda item: item["y"])
+            if len(nearby) > 2:
+                nearby = sorted(nearby, key=lambda item: abs(item["y"] - center))[:2]
+                nearby.sort(key=lambda item: item["y"])
+
+            values = []
+            for item in sorted(group, key=lambda item: item["x"]):
+                values.extend(item["values"])
+            if not nearby or len(values) < 2:
+                continue
+            if len(nearby) >= 2:
+                team1, team2 = nearby[0]["team"], nearby[1]["team"]
+            elif nearby[0]["y"] <= center:
+                team1, team2 = nearby[0]["team"], ""
+            else:
+                team1, team2 = "", nearby[0]["team"]
+            ml1, ml2 = values[:2]
+            two_plus_slot, two_plus_pct = None, None
+            if len(values) >= 4:
+                two_plus_slot = 1 if ml1 < ml2 else 2
+                if two_plus_slot == 1:
+                    two_plus_pct = fair_probability(values[2], values[3]) * 100
+                else:
+                    two_plus_pct = fair_probability(values[3], values[2]) * 100
+            desktop_coordinate_detected.append({
+                "チーム1": team1, "オッズ1": ml1,
+                "チーム2": team2, "オッズ2": ml2,
+                "出しチーム": team1, "ハンデ": "0",
+                "出し2点差以上(%)": None,
+                "_ocr_2plus_slot": two_plus_slot,
+                "_ocr_2plus_pct": two_plus_pct,
+            })
+        if desktop_coordinate_detected:
+            found = desktop_coordinate_detected
     raw_text = "\n".join(line["text"] for line in lines)
     # 座標グループが崩れた場合、OCR生テキストに残ったオッズを上から4個ずつ復元する。
     normalized_raw = raw_text.translate(circled_digits)
@@ -359,6 +450,9 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
         raw_ordered = [[row[0], row[2], row[1], row[3]] for row in raw_ordered]
     if is_mobile_layout or len(raw_ordered) > len(ordered_numeric):
         ordered_numeric = raw_ordered
+    if desktop_coordinate_detected:
+        # PC版もチーム名で照合し、貼り付け欄の順番による誤配を防ぐ。
+        ordered_numeric = []
 
     if is_mobile_layout:
         # 携帯版は各試合の境界線が画面幅いっぱいに入る。境界ごとに右半分を
@@ -382,7 +476,14 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
         for y in boundaries:
             if not filtered_boundaries or y - filtered_boundaries[-1] > 80:
                 filtered_boundaries.append(y)
+        # 携帯スクリーンショットの先頭・末尾が途中で切れていても、
+        # 画像端を仮の境界として最初／最後の試合を処理する。
+        if not filtered_boundaries or filtered_boundaries[0] > 80:
+            filtered_boundaries.insert(0, 0)
+        if filtered_boundaries[-1] < original.height - 80:
+            filtered_boundaries.append(original.height)
         mobile_rows = []
+        mobile_detected = []
         mobile_debug = []
         for top, bottom in zip(filtered_boundaries, filtered_boundaries[1:]):
             if bottom - top < 100:
@@ -400,25 +501,120 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 # HC欄は上部の「±1.5」を除き、下側のオッズだけ読む。
                 if box_index >= 2:
                     y1 += int((y2 - y1) * 0.38)
-                crop = original.crop((int(original.width * x1), y1,
-                                      int(original.width * x2), y2))
-                crop = crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS)
-                crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
-                crop = crop.point(lambda pixel: 0 if pixel < 170 else 255)
-                numeric_text = pytesseract.image_to_string(
-                    crop, lang="eng",
-                    config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.+-",
+                source_crop = original.crop((int(original.width * x1), y1,
+                                             int(original.width * x2), y2))
+                enlarged = source_crop.resize((source_crop.width * 3, source_crop.height * 3),
+                                              Image.Resampling.LANCZOS)
+                gray_crop = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
+                attempts = [
+                    (gray_crop.point(lambda pixel: 0 if pixel < 170 else 255), "7"),
+                    (gray_crop, "6"),
+                    (enlarged, "7"),
+                ]
+                detected_value = None
+                attempt_texts = []
+                for attempt_image, psm in attempts:
+                    numeric_text = pytesseract.image_to_string(
+                        attempt_image, lang="eng",
+                        config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789.+-",
+                    )
+                    attempt_texts.append(numeric_text.strip())
+                    matches = re.findall(r"[1-9][.,]\d{3}", numeric_text)
+                    if matches:
+                        detected_value = float(matches[-1].replace(",", "."))
+                        break
+                    compact = re.findall(r"(?<!\d)([1-9]\d{3})(?!\d)", numeric_text)
+                    if compact:
+                        digits = compact[-1]
+                        detected_value = float(f"{digits[0]}.{digits[1:]}")
+                        break
+                # 個別OCRでも欠落した場合、全体の座標OCRから同じ枠内の数字を探す。
+                if detected_value is None:
+                    x_low, x_high = original.width * x1 * scale, original.width * x2 * scale
+                    y_low, y_high = y1 * scale, y2 * scale
+                    coordinate_hits = [item for item in numeric_odds
+                                       if x_low <= item["x"] <= x_high
+                                       and y_low <= item["y"] <= y_high]
+                    if coordinate_hits:
+                        center_x = (x_low + x_high) / 2
+                        center_y = (y_low + y_high) / 2
+                        nearest_hit = min(coordinate_hits,
+                                          key=lambda item: abs(item["x"] - center_x)
+                                          + abs(item["y"] - center_y))
+                        if nearest_hit["values"]:
+                            detected_value = nearest_hit["values"][-1]
+                debug_parts.append(" -> ".join(attempt_texts))
+                values.append(detected_value)
+
+            # 携帯版は貼り付け欄と画像の試合順が異なることがある。
+            # 左側を試合単位でOCRし、数字を必ずその2チームへ結び付ける。
+            team_texts = []
+            block_height = bottom - top
+            block_teams = [None, None]
+            # チーム名2行は試合ブロック上部にあるため、行ごとに狭く切り出す。
+            team_bands = ((0.16, 0.40), (0.36, 0.61))
+            for slot, (start_rate, end_rate) in enumerate(team_bands):
+                y1 = top + int(block_height * start_rate)
+                y2 = top + int(block_height * end_rate)
+                source_team = original.crop((0, y1, int(original.width * 0.53), y2))
+                enlarged_team = source_team.resize(
+                    (source_team.width * 3, source_team.height * 3), Image.Resampling.LANCZOS
                 )
-                debug_parts.append(numeric_text.strip())
-                matches = re.findall(r"[1-9][.,]\d{3}", numeric_text)
-                values.append(float(matches[-1].replace(",", ".")) if matches else None)
-            mobile_debug.append(" / ".join(debug_parts))
+                gray_team = ImageOps.autocontrast(ImageOps.grayscale(enlarged_team))
+                best_team, best_score = None, 0.0
+                slot_texts = []
+                for attempt_image, psm in ((gray_team, "7"), (enlarged_team, "7"), (gray_team, "6")):
+                    team_text = pytesseract.image_to_string(
+                        attempt_image, lang="jpn+eng", config=f"--oem 3 --psm {psm}"
+                    ).strip()
+                    slot_texts.append(team_text.replace("\n", " / "))
+                    team, score = _match_team(team_text)
+                    if team and score > best_score:
+                        best_team, best_score = team, score
+                # 曖昧な文字列を別チームと決めつけない。
+                if best_score >= 0.68:
+                    block_teams[slot] = best_team
+                team_texts.append(" -> ".join(slot_texts))
+
+            mobile_debug.append(
+                " / ".join(debug_parts)
+                + " | TEAMS: " + " -> ".join(team_texts)
+                + " => " + ", ".join(team or "?" for team in block_teams)
+            )
             if all(value is not None for value in values):
                 # 4分割済みなので共通形式 [ML1, ML2, HC1, HC2] の順。
                 mobile_rows.append(values)
-        if mobile_rows:
-            ordered_numeric = mobile_rows
-            raw_text += "\n[MOBILE ODDS] " + " | ".join(mobile_debug)
+                if any(block_teams):
+                    team1, team2 = block_teams
+                    ml1, ml2, runline1, runline2 = values
+                    if ml1 < ml2:
+                        two_plus_team = team1 or ""
+                        two_plus_slot = 1
+                        two_plus_pct = fair_probability(runline1, runline2) * 100
+                    else:
+                        two_plus_team = team2 or ""
+                        two_plus_slot = 2
+                        two_plus_pct = fair_probability(runline2, runline1) * 100
+                    mobile_detected.append({
+                        "チーム1": team1 or "", "オッズ1": ml1,
+                        "チーム2": team2 or "", "オッズ2": ml2,
+                        "出しチーム": team1 or "", "ハンデ": "0",
+                        "出し2点差以上(%)": None,
+                        "_ocr_2plus_team": two_plus_team,
+                        "_ocr_2plus_slot": two_plus_slot,
+                        "_ocr_2plus_pct": two_plus_pct,
+                    })
+        expected_mobile_rows = sum(1 for top, bottom in zip(filtered_boundaries, filtered_boundaries[1:])
+                                   if bottom - top >= 100)
+        if mobile_detected:
+            # 対戦カード名で照合するため、順番だけの数値割り当ては無効にする。
+            # 全体OCRの誤った組み合わせで、正しい携帯ブロック結果を上書きさせない。
+            found = mobile_detected
+            ordered_numeric = []
+        elif mobile_rows and len(mobile_rows) == expected_mobile_rows:
+            # チーム名を認識できなかった場合も、誤った試合へ割り当てない。
+            ordered_numeric = []
+        raw_text += "\n[MOBILE ODDS] " + " | ".join(mobile_debug)
     return raw_text, found, ordered_numeric
 
 
@@ -503,8 +699,11 @@ with tab1:
                     raw_text, detected, ordered_numeric = ocr_moneylines(upload)
                     st.session_state.ocr = raw_text
                     if detected or ordered_numeric:
+                        # 前回OCRの誤認識行を残さず、現在の貼り付け文章を正本にする。
+                        pasted_rows = parse_other_site(pasted) if pasted.strip() else []
+                        base_rows = pasted_rows or st.session_state.get("rows")
                         merged_rows = _merge_ocr_rows(
-                            detected, st.session_state.get("rows"), ordered_numeric)
+                            detected, base_rows, ordered_numeric)
                         st.session_state.rows = merged_rows
                         st.session_state.pop("games", None)
                         hc_count = sum(not pd.isna(row.get("出し2点差以上(%)"))
@@ -549,6 +748,12 @@ with tab1:
                     else:
                         st.error(f"{t1} vs {t2}: 『出し2点差以上(%)』を入力してください。")
                         continue
+                if p_2plus > pg + 0.0001:
+                    st.error(
+                        f"{t1} vs {t2}: 2点差以上勝率（{p_2plus:.1%}）が"
+                        f"通常勝率（{pg:.1%}）を超えています。画像を再抽出するか数値を確認してください。"
+                    )
+                    continue
                 for team, is_giver in ((giver, True), (t2 if giver == t1 else t1, False)):
                     ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost)
                     rank, stake = classify(ev * 100)
