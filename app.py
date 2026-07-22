@@ -19,21 +19,35 @@ DATA_DIR.mkdir(exist_ok=True)
 
 TEAM_ALIASES = {
     # セ・リーグ（Pinnacle表記 → ツール内の表示名）
-    "読売ジャイアンツ": "巨人", "東京読売ジャイアンツ": "巨人", "巨人": "巨人",
-    "中日ドラゴンズ": "中日", "中日": "中日",
-    "横浜ベイスターズ": "横浜", "横浜DeNAベイスターズ": "横浜",
-    "横浜ＤｅＮＡベイスターズ": "横浜", "DeNA": "横浜", "横浜": "横浜",
+    "読売ジャイアンツ": "巨人", "東京読売ジャイアンツ": "巨人", "ジャイアンツ": "巨人",
+    "中日ドラゴンズ": "中日", "ドラゴンズ": "中日",
+    "横浜ＤｅＮＡベイスターズ": "横浜", "DeNA": "横浜", "ベイスターズ": "横浜",
     "東京ヤクルトスワローズ": "ヤクルト", "ヤクルトスワローズ": "ヤクルト", "ヤクルト": "ヤクルト",
-    "阪神タイガース": "阪神", "阪神": "阪神",
-    "広島東洋カープ": "広島", "広島カープ": "広島", "広島": "広島",
+    "阪神タイガース": "阪神", "タイガース": "阪神",
+    "広島東洋カープ": "広島", "広島カープ": "広島", "カープ": "広島",
 
     # パ・リーグ（Pinnacle表記 → ツール内の表示名）
     "東北楽天ゴールデンイーグルス": "楽天", "楽天ゴールデンイーグルス": "楽天", "楽天": "楽天",
-    "千葉ロッテマリーンズ": "ロッテ", "ロッテマリーンズ": "ロッテ", "ロッテ": "ロッテ",
-    "北海道日本ハムファイターズ": "日本ハム", "日本ハムファイターズ": "日本ハム", "日本ハム": "日本ハム",
+    "千葉ロッテマリーンズ": "ロッテ", "ロッテマリーンズ": "ロッテ", "千葉": "ロッテ",
+    "北海道日本ハムファイターズ": "日本ハム", "日本ハムファイターズ": "日本ハム", "ファイターズ": "日本ハム",
     "埼玉西武ライオンズ": "西武", "西武ライオンズ": "西武", "西武": "西武",
     "オリックス・バファローズ": "オリックス", "オリックスバファローズ": "オリックス", "オリックス": "オリックス",
-    "福岡ソフトバンクホークス": "ソフトバンク", "ソフトバンクホークス": "ソフトバンク", "ソフトバンク": "ソフトバンク",
+    "福岡ソフトバンクホークス": "ソフトバンク", "ソフトバンクホークス": "ソフトバンク", "ホークス": "ソフトバンク", "ソフト": "ソフトバンク",
+}
+
+# TEAM_ALIASESは正式ルールとして固定し、画像OCR特有の崩れだけをこちらで補正する。
+OCR_TEAM_ALIASES = {
+    "ゴールデンイーグルス": "楽天",
+    "ゴオールデンイーグルス": "楽天",
+    "東北楽天": "楽天",
+    "楽天イーグルス": "楽天",
+    "バファローズ": "オリックス",
+    "パバファローズ": "オリックス",
+    "オリックスバファローズ": "オリックス",
+}
+
+TEAM_TYPOS = {
+    "西部": "西武",
 }
 
 # 出し側の精算倍率。+は勝ち、-は負け、0は返金。
@@ -56,7 +70,7 @@ HANDICAP = {
 
 def norm_team(value: str) -> str:
     value = re.sub(r"\s+", "", str(value))
-    return TEAM_ALIASES.get(value, value)
+    return TEAM_TYPOS.get(value, TEAM_ALIASES.get(value, value))
 
 
 def parse_handicap(token: str) -> float:
@@ -65,7 +79,7 @@ def parse_handicap(token: str) -> float:
                "1半5": 1.5 + 1 / 6 + 0.01, "1半7": 1.7 + 1 / 6}
     if token in special:
         return special[token]
-    if token in {"03", "05", "07"}:
+    if re.fullmatch(r"0[1-9]", token):
         token = "0." + token[-1]
     return float(token or 0)
 
@@ -82,7 +96,8 @@ def parse_other_site(text: str) -> list[dict]:
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     teams = []
     for line in lines:
-        if re.fullmatch(r"\d{1,2}:\d{2}", line):
+        # 時刻の後ろに <0> が付く入力もチーム名として扱わない。
+        if re.fullmatch(r"\d{1,2}:\d{2}(?:[<＜][^>＞]+[>＞])?", line):
             continue
         m = re.match(r"^(.*?)(?:[<＜]([^>＞]+)[>＞])?$", line)
         if m and m.group(1):
@@ -119,7 +134,7 @@ def _match_team(text: str) -> tuple[str | None, float]:
     if not cleaned or re.fullmatch(r"[\d:：]+", cleaned):
         return None, 0.0
     best_team, best_score = None, 0.0
-    for alias, short_name in TEAM_ALIASES.items():
+    for alias, short_name in {**TEAM_ALIASES, **OCR_TEAM_ALIASES}.items():
         target = _clean_ocr(alias)
         if target in cleaned:
             # 同一行の右側にオッズが連結されていても正式名が含まれれば採用。
@@ -133,25 +148,50 @@ def _match_team(text: str) -> tuple[str | None, float]:
     return (best_team, best_score) if best_score >= 0.52 else (None, best_score)
 
 
-def _merge_ocr_rows(found: list[dict], existing: list[dict] | None) -> list[dict]:
+def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
+                    ordered_numeric: list[list[float]] | None = None) -> list[dict]:
     if not existing:
-        return found
+        return [{k: v for k, v in row.items() if not k.startswith("_ocr_")} for row in found]
     merged = [dict(row) for row in existing]
     for detected in found:
         detected_pair = {norm_team(detected["チーム1"]), norm_team(detected["チーム2"])}
         match = next((row for row in merged if
                       {norm_team(row.get("チーム1", "")), norm_team(row.get("チーム2", ""))} == detected_pair), None)
         if match is None:
-            merged.append(detected)
+            merged.append({k: v for k, v in detected.items() if not k.startswith("_ocr_")})
             continue
         if norm_team(match["チーム1"]) == norm_team(detected["チーム1"]):
             match["オッズ1"], match["オッズ2"] = detected["オッズ1"], detected["オッズ2"]
         else:
             match["オッズ1"], match["オッズ2"] = detected["オッズ2"], detected["オッズ1"]
+        giver = norm_team(match.get("出しチーム", ""))
+        hcap = parse_handicap(str(match.get("ハンデ", "0")))
+        if (abs(hcap) > 1e-9
+                and giver == norm_team(detected.get("_ocr_2plus_team", ""))
+                and detected.get("_ocr_2plus_pct") is not None):
+            match["出し2点差以上(%)"] = round(float(detected["_ocr_2plus_pct"]), 2)
+    # チーム文字が崩れても、貼り付け表と画像の試合数が同じなら上から順に補完する。
+    if ordered_numeric and len(ordered_numeric) == len(merged):
+        for row, values in zip(merged, ordered_numeric):
+            if len(values) < 2:
+                continue
+            row["オッズ1"], row["オッズ2"] = values[0], values[1]
+            hcap = parse_handicap(str(row.get("ハンデ", "0")))
+            if abs(hcap) < 1e-9 or len(values) < 4:
+                continue
+            team1, team2 = norm_team(row.get("チーム1", "")), norm_team(row.get("チーム2", ""))
+            giver = norm_team(row.get("出しチーム", ""))
+            favorite = team1 if values[0] < values[1] else team2
+            if giver == favorite:
+                if favorite == team1:
+                    probability = fair_probability(values[2], values[3]) * 100
+                else:
+                    probability = fair_probability(values[3], values[2]) * 100
+                row["出し2点差以上(%)"] = round(probability, 2)
     return merged
 
 
-def ocr_moneylines(upload) -> tuple[str, list[dict]]:
+def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
     """OCR座標からチーム2行と同じ試合帯の左側2オッズを結合する。"""
     import pytesseract
     from pytesseract import Output
@@ -171,6 +211,12 @@ def ocr_moneylines(upload) -> tuple[str, list[dict]]:
     image = image.filter(ImageFilter.SHARPEN)
     data = pytesseract.image_to_data(image, lang="jpn+eng", config="--oem 3 --psm 6",
                                      output_type=Output.DICT)
+    # 数字は日本語OCRと分離し、英数字限定でもう一度読むと精度が大きく上がる。
+    numeric_data = pytesseract.image_to_data(
+        image, lang="eng",
+        config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.+-",
+        output_type=Output.DICT,
+    )
 
     grouped: dict[tuple[int, int, int], list[int]] = {}
     for i, raw in enumerate(data["text"]):
@@ -194,6 +240,8 @@ def ocr_moneylines(upload) -> tuple[str, list[dict]]:
     circled_digits = str.maketrans({
         "⓪": "0", "①": "1", "②": "2", "③": "3", "④": "4",
         "⑤": "5", "⑥": "6", "⑦": "7", "⑧": "8", "⑨": "9",
+        "⑩": "10", "⑪": "11", "⑫": "12", "⑬": "13", "⑭": "14",
+        "⑮": "15", "⑯": "16", "⑰": "17", "⑱": "18", "⑲": "19", "⑳": "20",
     })
     odds_pattern = re.compile(r"(?<!\d)([1-9](?:[.,]\d{2,3}))(?!\d)")
     for line in lines:
@@ -211,8 +259,54 @@ def ocr_moneylines(upload) -> tuple[str, list[dict]]:
         team, score = _match_team(line["text"])
         # 下段チーム名と2個のオッズが同じOCR行になる場合もチームとして残す。
         if team:
-            if not teams or teams[-1]["team"] != team or abs(teams[-1]["y"] - line["y"]) > 25 * scale:
+            # 同じチーム名がML行とハンデ行で連続して出ることがあるため、
+            # 距離に関係なく連続重複は1件へまとめる。
+            if not teams or teams[-1]["team"] != team:
                 teams.append({**line, "team": team, "score": score})
+
+    numeric_odds = []
+    simple_odds_pattern = re.compile(r"[1-9][.,]\d{3}")
+    compact_odds_pattern = re.compile(r"(?<![\d.,])([1-9]\d{3})(?!\d)")
+    joined_odds_pattern = re.compile(r"(?<!\d)([1-9]\d{3})(?=[1-9][.,]\d{3})")
+    for i, raw in enumerate(numeric_data["text"]):
+        text_value = str(raw).translate(circled_digits)
+        candidates = []
+        for match in simple_odds_pattern.finditer(text_value):
+            candidates.append((match.start(), float(match.group().replace(",", "."))))
+        # 数字限定OCRは小数点を落として「2.430」を「2430」と読む場合がある。
+        for pattern in (compact_odds_pattern, joined_odds_pattern):
+            for match in pattern.finditer(text_value):
+                digits = match.group(1)
+                candidates.append((match.start(), float(f"{digits[0]}.{digits[1:]}")))
+        values = [value for _, value in sorted(set(candidates)) if 1.01 <= value <= 20]
+        if values:
+            numeric_odds.append({
+                "text": text_value,
+                "x": numeric_data["left"][i] + numeric_data["width"][i] / 2,
+                "y": numeric_data["top"][i] + numeric_data["height"][i] / 2,
+                "values": values,
+            })
+    if len(numeric_odds) >= 2:
+        odds = numeric_odds
+
+    # 数字だけをY座標で試合行にまとめる。チーム名認識に失敗した場合の予備ルート。
+    numeric_groups: list[list[dict]] = []
+    for item in sorted(numeric_odds, key=lambda value: (value["y"], value["x"])):
+        if not numeric_groups:
+            numeric_groups.append([item])
+            continue
+        group_y = sum(value["y"] for value in numeric_groups[-1]) / len(numeric_groups[-1])
+        if abs(item["y"] - group_y) <= 20 * scale:
+            numeric_groups[-1].append(item)
+        else:
+            numeric_groups.append([item])
+    ordered_numeric = []
+    for group in numeric_groups:
+        row_values = []
+        for item in sorted(group, key=lambda value: value["x"]):
+            row_values.extend(item["values"])
+        if len(row_values) >= 2:
+            ordered_numeric.append(row_values[:4])
 
     found = []
     for i in range(0, len(teams) - 1, 2):
@@ -220,22 +314,48 @@ def ocr_moneylines(upload) -> tuple[str, list[dict]]:
         # Pinnacleの配置規則：上段チーム＝左オッズ、下段チーム＝右オッズ。
         # オッズはOCR上で下段チームと同じ行になりやすいため、下段のY座標を優先する。
         nearest = min(odds, key=lambda item: abs(item["y"] - second["y"]), default=None)
-        values = list(nearest["values"][:2]) if nearest else []
-        # OCRが左右のオッズを別々の行要素へ分割した場合だけ、同じ高さの要素を結合する。
-        if nearest and len(values) < 2:
+        values = []
+        if nearest:
+            # 同じ試合行の数値を左から収集：ML1, ML2, HC1, HC2。
             same_height = [item for item in odds
-                           if abs(item["y"] - nearest["y"]) <= 12 * scale]
-            values = []
+                           if abs(item["y"] - nearest["y"]) <= 20 * scale]
             for item in sorted(same_height, key=lambda item: item["x"]):
                 values.extend(item["values"])
-            values = values[:2]
-        if len(values) == 2:
+        if len(values) >= 2:
+            two_plus_team = None
+            two_plus_pct = None
+            if len(values) >= 4:
+                ml1, ml2, runline1, runline2 = values[:4]
+                # Pinnacleの通常表示ではML本命側が-1.5、もう一方が+1.5。
+                if ml1 < ml2:
+                    two_plus_team = first["team"]
+                    two_plus_pct = fair_probability(runline1, runline2) * 100
+                else:
+                    two_plus_team = second["team"]
+                    two_plus_pct = fair_probability(runline2, runline1) * 100
             found.append({"チーム1": first["team"], "オッズ1": values[0],
                           "チーム2": second["team"], "オッズ2": values[1],
                           "出しチーム": first["team"], "ハンデ": "0",
-                          "出し2点差以上(%)": None})
+                          "出し2点差以上(%)": None,
+                          "_ocr_2plus_team": two_plus_team,
+                          "_ocr_2plus_pct": two_plus_pct})
     raw_text = "\n".join(line["text"] for line in lines)
-    return raw_text, found
+    # 座標グループが崩れた場合、OCR生テキストに残ったオッズを上から4個ずつ復元する。
+    normalized_raw = raw_text.translate(circled_digits)
+    normalized_raw = re.sub(r"\b\d{1,2}:\d{2}\b", " ", normalized_raw)
+    normalized_raw = re.sub(r"(?<!\d)([1-4])\s+(\d{3})(?!\d)", r"\1.\2", normalized_raw)
+    raw_candidates = []
+    for match in re.finditer(r"[1-9][.,]\d{3}", normalized_raw):
+        raw_candidates.append((match.start(), float(match.group().replace(",", "."))))
+    for match in re.finditer(r"(?<![\d.,])([1-9]\d{3})(?!\d)", normalized_raw):
+        digits = match.group(1)
+        raw_candidates.append((match.start(), float(f"{digits[0]}.{digits[1:]}")))
+    raw_values = [value for _, value in sorted(set(raw_candidates)) if 1.01 <= value <= 20]
+    raw_ordered = [raw_values[i:i + 4] for i in range(0, len(raw_values), 4)
+                   if len(raw_values[i:i + 4]) == 4]
+    if len(raw_ordered) > len(ordered_numeric):
+        ordered_numeric = raw_ordered
+    return raw_text, found, ordered_numeric
 
 
 def fair_probability(odds_a: float, odds_b: float) -> float:
@@ -316,13 +436,20 @@ with tab1:
             st.image(upload, use_container_width=True)
             if st.button("画像からマネーラインを抽出", type="primary"):
                 try:
-                    raw_text, detected = ocr_moneylines(upload)
+                    raw_text, detected, ordered_numeric = ocr_moneylines(upload)
                     st.session_state.ocr = raw_text
-                    if detected:
-                        st.session_state.rows = _merge_ocr_rows(
-                            detected, st.session_state.get("rows"))
+                    if detected or ordered_numeric:
+                        merged_rows = _merge_ocr_rows(
+                            detected, st.session_state.get("rows"), ordered_numeric)
+                        st.session_state.rows = merged_rows
                         st.session_state.pop("games", None)
-                        st.success(f"{len(detected)}試合のチーム名とマネーラインを抽出しました。")
+                        hc_count = sum(not pd.isna(row.get("出し2点差以上(%)"))
+                                       for row in merged_rows)
+                        game_count = len(ordered_numeric) or len(detected)
+                        st.success(
+                            f"{game_count}試合のマネーラインを抽出しました。"
+                            f" うち{hc_count}試合で±1.5市場も認識しました。"
+                        )
                     else:
                         st.error("試合とオッズを組み合わせられませんでした。下のOCR結果を確認してください。")
                 except Exception as exc:
