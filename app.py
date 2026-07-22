@@ -261,26 +261,21 @@ def outcome_rate(handicap: float, giver_bet: bool, winner_is_giver: bool, margin
     return giver_rate if giver_bet else -giver_rate
 
 
-def calc_side(p_giver: float, handicap: float, giver_bet: bool, draw_p: float,
-              margin1: float, margin2: float, win_return: float, loss_cost: float,
-              giver_2plus: float | None = None) -> float:
-    p_giver *= (1 - draw_p)
-    p_receiver = (1 - p_giver / (1 - draw_p)) * (1 - draw_p)
-    ev = 0.0
-    if giver_2plus is not None:
-        # -1.5市場から得た無条件の「出し側2点差以上」確率。
-        p_2plus = max(0.0, min(giver_2plus, p_giver))
-        giver_margins = ((1, p_giver - p_2plus), (2, p_2plus))
-    else:
-        margin3 = 1 - margin1 - margin2
-        giver_margins = ((1, p_giver * margin1), (2, p_giver * margin2),
-                         (3, p_giver * margin3))
-    for margin, probability in giver_margins:
-        ev += probability * profit(outcome_rate(handicap, giver_bet, True, margin), win_return, loss_cost)
-    # 受け側が勝つ場合、出し側は点差にかかわらず丸負け。
-    ev += p_receiver * profit(outcome_rate(handicap, giver_bet, False, 1), win_return, loss_cost)
-    ev += draw_p * profit(outcome_rate(handicap, giver_bet, True, 0), win_return, loss_cost)
-    return ev
+def calc_side(p_ml: float, p_hc: float, handicap: float, giver_bet: bool,
+              win_return: float, loss_cost: float) -> float:
+    """新式：A=2点差以上、B=1点差、C=それ以外。引き分けは独立させない。"""
+    if not 0 <= p_hc <= p_ml <= 1:
+        raise ValueError("2点差以上の確率は、勝利確率以下にしてください")
+    pattern_a = p_hc
+    pattern_b = p_ml - p_hc
+    pattern_c = 1 - p_ml
+    if giver_bet:
+        return (pattern_a * win_return
+                + pattern_b * (win_return * (1 - handicap))
+                - pattern_c * loss_cost)
+    return (pattern_c * win_return
+            - pattern_b * (loss_cost * (1 - handicap))
+            - pattern_a * loss_cost)
 
 
 def classify(ev_pct: float) -> tuple[str, int]:
@@ -299,15 +294,9 @@ st.caption("Pinnacleのマネーラインを市場確率に変換し、ハンデ
 
 with st.sidebar:
     st.header("計算設定")
-    draw_pct = st.number_input("引き分け確率 (%)", 0.0, 30.0, 5.0, .5) / 100
     win_return = st.number_input("勝ち利益率 (%)", 0.0, 200.0, 92.0, 1.0) / 100
     loss_cost = st.number_input("負け支払率 (%)", 0.0, 200.0, 98.0, 1.0) / 100
-    st.subheader("勝利時の点差配分")
-    margin1 = st.number_input("1点差 (%)", 0.0, 100.0, 37.0, 1.0) / 100
-    margin2 = st.number_input("2点差 (%)", 0.0, 100.0, 25.0, 1.0) / 100
-    if margin1 + margin2 > 1:
-        st.error("1点差と2点差の合計は100%以下にしてください。")
-    st.caption(f"3点差以上: {max(0, 1-margin1-margin2):.0%}")
+    st.caption("引き分けは独立計算せず『本命勝利以外』へ含めます。")
     bankroll = st.number_input("総資金 (円)", 0, value=100000, step=10000)
 
 tab1, tab2 = st.tabs(["入力・計算", "計算方法"])
@@ -351,7 +340,7 @@ with tab1:
     edited = st.data_editor(pd.DataFrame(initial), num_rows="dynamic", hide_index=True,
                             use_container_width=True, key="games")
 
-    if st.button("期待値を計算", type="primary", disabled=margin1 + margin2 > 1):
+    if st.button("期待値を計算", type="primary"):
         results = []
         for _, row in edited.iterrows():
             try:
@@ -363,9 +352,14 @@ with tab1:
                 p_2plus = None if pd.isna(raw_2plus) else float(raw_2plus) / 100
                 p1 = fair_probability(o1, o2)
                 pg = p1 if giver == t1 else 1 - p1
+                if p_2plus is None:
+                    if abs(hcap) < 1e-9:
+                        p_2plus = pg
+                    else:
+                        st.error(f"{t1} vs {t2}: 『出し2点差以上(%)』を入力してください。")
+                        continue
                 for team, is_giver in ((giver, True), (t2 if giver == t1 else t1, False)):
-                    ev = calc_side(pg, hcap, is_giver, draw_pct, margin1, margin2,
-                                   win_return, loss_cost, p_2plus)
+                    ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost)
                     rank, stake = classify(ev * 100)
                     results.append({"対戦": f"{t1} vs {t2}", "ベット": team,
                                     "区分": "出し" if is_giver else "もらい",
@@ -393,12 +387,12 @@ with tab2:
     st.markdown("""
 ### 計算の考え方
 
-1. 両チームのPinnacleオッズを逆数にし、合計が100%になるよう正規化してマージンを除去します。
-2. 設定した引き分け確率を取り分け、残りを勝敗確率へ配分します。
-3. ハンデ表に従い、引き分け・1点差・2点差・3点差以上の損益を計算します。分勝ち・分負けは表記どおり（7分勝ち=+70%）です。
-4. `期待値 = 各結果の確率 × その結果の利益率` の合計です。
-5. EV 5%以上＝大3%、3%以上＝中2%、0%超＝小1%、0%以下＝見送りです。
+1. マネーライン両側のオッズを正規化し、出し側の真の勝率 `P_ML` を求めます。
+2. -1.5市場の両側を正規化して求めた「出し側2点差以上の確率」を入力します。
+3. A=`P_HC`、B=`P_ML-P_HC`、C=`1-P_ML` の3パターンへ分解します。
+4. 分勝ち・分負けにも手数料を適用します（7分勝ちなら `92%×0.7=64.4%`）。
+5. 引き分けは独立させずCへ含めます。
+6. EV 5%以上＝大3%、3%以上＝中2%、0%超＝小1%、0%以下＝見送りです。
 
-`1.3`以上のハンデは得点差で精算が変わるため、マネーラインだけでは一意に計算できません。
-Pinnacleのランライン（-1.5）から算出した確率がある場合は「出し2点差以上(%)」へ入力します。空欄なら左側の点差配分を仮定値として使用します。
+ハンデが0以外の場合、`出し2点差以上(%)`は必須です。
     """)
