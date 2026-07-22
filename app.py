@@ -204,6 +204,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
             "TesseractインストーラーでJapaneseを追加してから、アプリを再起動してください。"
         )
     original = Image.open(io.BytesIO(upload.getvalue())).convert("RGB")
+    is_mobile_layout = original.height > original.width * 1.2
     scale = max(2, min(4, 1800 // max(original.width, 1)))
     image = original.resize((original.width * scale, original.height * scale), Image.Resampling.LANCZOS)
     image = ImageOps.grayscale(image)
@@ -353,8 +354,71 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
     raw_values = [value for _, value in sorted(set(raw_candidates)) if 1.01 <= value <= 20]
     raw_ordered = [raw_values[i:i + 4] for i in range(0, len(raw_values), 4)
                    if len(raw_values[i:i + 4]) == 4]
-    if len(raw_ordered) > len(ordered_numeric):
+    if is_mobile_layout:
+        # 携帯版の読み順 [ML1, HC1, ML2, HC2] を共通形式へ変換。
+        raw_ordered = [[row[0], row[2], row[1], row[3]] for row in raw_ordered]
+    if is_mobile_layout or len(raw_ordered) > len(ordered_numeric):
         ordered_numeric = raw_ordered
+
+    if is_mobile_layout:
+        # 携帯版は各試合の境界線が画面幅いっぱいに入る。境界ごとに右半分を
+        # 切り出して再OCRし、全体OCRで欠落した数字を補う。
+        gray_original = ImageOps.grayscale(original)
+        separator_rows = []
+        for y in range(50, gray_original.height):
+            pixels = list(gray_original.crop((0, y, gray_original.width, y + 1)).getdata())
+            mean = sum(pixels) / len(pixels)
+            if max(pixels) - min(pixels) <= 3 and mean < 240:
+                separator_rows.append(y)
+        separator_groups = []
+        for y in separator_rows:
+            if not separator_groups or y - separator_groups[-1][-1] > 2:
+                separator_groups.append([y])
+            else:
+                separator_groups[-1].append(y)
+        boundaries = [round(sum(group) / len(group)) for group in separator_groups]
+        # 近すぎる装飾線を除き、試合ブロックを作る。
+        filtered_boundaries = []
+        for y in boundaries:
+            if not filtered_boundaries or y - filtered_boundaries[-1] > 80:
+                filtered_boundaries.append(y)
+        mobile_rows = []
+        mobile_debug = []
+        for top, bottom in zip(filtered_boundaries, filtered_boundaries[1:]):
+            if bottom - top < 100:
+                continue
+            middle = (top + bottom) // 2
+            boxes = [
+                (0.52, top + 20, 0.76, middle),
+                (0.52, middle, 0.76, bottom - 15),
+                (0.76, top + 20, 0.995, middle),
+                (0.76, middle, 0.995, bottom - 15),
+            ]
+            values = []
+            debug_parts = []
+            for box_index, (x1, y1, x2, y2) in enumerate(boxes):
+                # HC欄は上部の「±1.5」を除き、下側のオッズだけ読む。
+                if box_index >= 2:
+                    y1 += int((y2 - y1) * 0.38)
+                crop = original.crop((int(original.width * x1), y1,
+                                      int(original.width * x2), y2))
+                crop = crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS)
+                crop = ImageOps.autocontrast(ImageOps.grayscale(crop))
+                crop = crop.point(lambda pixel: 0 if pixel < 170 else 255)
+                numeric_text = pytesseract.image_to_string(
+                    crop, lang="eng",
+                    config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.+-",
+                )
+                debug_parts.append(numeric_text.strip())
+                matches = re.findall(r"[1-9][.,]\d{3}", numeric_text)
+                values.append(float(matches[-1].replace(",", ".")) if matches else None)
+            mobile_debug.append(" / ".join(debug_parts))
+            if all(value is not None for value in values):
+                # 4分割済みなので共通形式 [ML1, ML2, HC1, HC2] の順。
+                mobile_rows.append(values)
+        if mobile_rows:
+            ordered_numeric = mobile_rows
+            raw_text += "\n[MOBILE ODDS] " + " | ".join(mobile_debug)
     return raw_text, found, ordered_numeric
 
 
