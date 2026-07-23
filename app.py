@@ -114,8 +114,10 @@ def parse_other_site(text: str) -> list[dict]:
         a, b = teams[i], teams[i + 1]
         giver = a[0] if a[2] else (b[0] if b[2] else a[0])
         handicap = a[1] if a[2] else (b[1] if b[2] else 0.0)
-        rows.append({"チーム1": a[0], "オッズ1": None, "チーム2": b[0], "オッズ2": None,
-                     "出しチーム": giver, "ハンデ": display_handicap(handicap)})
+        rows.append({"チーム1": a[0], "オッズ1": None, "オッズ1±": None,
+                     "チーム2": b[0], "オッズ2": None, "オッズ2±": None,
+                     "出しチーム": giver, "ハンデ": display_handicap(handicap),
+                     "出し2点差以上(%)": None, "もらい2点差以上(%)": None})
     return rows
 
 
@@ -177,8 +179,10 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
             same_order = norm_team(match["チーム2"]) == detected_team2
         if same_order:
             match["オッズ1"], match["オッズ2"] = detected["オッズ1"], detected["オッズ2"]
+            match["オッズ1±"], match["オッズ2±"] = detected.get("オッズ1±"), detected.get("オッズ2±")
         else:
             match["オッズ1"], match["オッズ2"] = detected["オッズ2"], detected["オッズ1"]
+            match["オッズ1±"], match["オッズ2±"] = detected.get("オッズ2±"), detected.get("オッズ1±")
         giver = norm_team(match.get("出しチーム", ""))
         hcap = parse_handicap(str(match.get("ハンデ", "0")))
         favorite_slot = detected.get("_ocr_2plus_slot")
@@ -198,16 +202,21 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
             if float(detected_2plus_pct) / 100 > p_detected_ml + 0.005:
                 detected_favorite = match_team2 if detected_favorite == match_team1 else match_team1
                 detected_2plus_pct = 100 - float(detected_2plus_pct)
-        if (abs(hcap) > 1e-9
-                and giver == detected_favorite
-                and detected_2plus_pct is not None):
-            match["出し2点差以上(%)"] = round(float(detected_2plus_pct), 2)
+        if abs(hcap) > 1e-9 and detected_2plus_pct is not None:
+            receiver = (norm_team(match["チーム2"]) if giver == norm_team(match["チーム1"])
+                        else norm_team(match["チーム1"]))
+            if giver == detected_favorite:
+                match["出し2点差以上(%)"] = round(float(detected_2plus_pct), 2)
+            elif receiver == detected_favorite:
+                match["もらい2点差以上(%)"] = round(float(detected_2plus_pct), 2)
     # チーム文字が崩れても、貼り付け表と画像の試合数が同じなら上から順に補完する。
     if ordered_numeric and len(ordered_numeric) == len(merged):
         for row, values in zip(merged, ordered_numeric):
             if len(values) < 2:
                 continue
             row["オッズ1"], row["オッズ2"] = values[0], values[1]
+            if len(values) >= 4:
+                row["オッズ1±"], row["オッズ2±"] = values[2], values[3]
             hcap = parse_handicap(str(row.get("ハンデ", "0")))
             if abs(hcap) < 1e-9 or len(values) < 4:
                 continue
@@ -371,9 +380,11 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                     two_plus_team = second["team"]
                     two_plus_pct = fair_probability(runline2, runline1) * 100
             found.append({"チーム1": first["team"], "オッズ1": values[0],
+                          "オッズ1±": values[2] if len(values) >= 4 else None,
                           "チーム2": second["team"], "オッズ2": values[1],
+                          "オッズ2±": values[3] if len(values) >= 4 else None,
                           "出しチーム": first["team"], "ハンデ": "0",
-                          "出し2点差以上(%)": None,
+                          "出し2点差以上(%)": None, "もらい2点差以上(%)": None,
                           "_ocr_2plus_team": two_plus_team,
                           "_ocr_2plus_pct": two_plus_pct})
 
@@ -423,9 +434,11 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                     two_plus_pct = fair_probability(values[3], values[2]) * 100
             desktop_coordinate_detected.append({
                 "チーム1": team1, "オッズ1": ml1,
+                "オッズ1±": values[2] if len(values) >= 4 else None,
                 "チーム2": team2, "オッズ2": ml2,
+                "オッズ2±": values[3] if len(values) >= 4 else None,
                 "出しチーム": team1, "ハンデ": "0",
-                "出し2点差以上(%)": None,
+                "出し2点差以上(%)": None, "もらい2点差以上(%)": None,
                 "_ocr_2plus_slot": two_plus_slot,
                 "_ocr_2plus_pct": two_plus_pct,
             })
@@ -496,10 +509,26 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 (0.76, middle, 0.995, bottom - 15),
             ]
             values = []
+            runline_signs = [None, None]
             debug_parts = []
             for box_index, (x1, y1, x2, y2) in enumerate(boxes):
                 # HC欄は上部の「±1.5」を除き、下側のオッズだけ読む。
                 if box_index >= 2:
+                    sign_crop = original.crop((
+                        int(original.width * x1), y1,
+                        int(original.width * x2), y1 + int((y2 - y1) * 0.48),
+                    ))
+                    sign_crop = sign_crop.resize(
+                        (sign_crop.width * 4, sign_crop.height * 4), Image.Resampling.LANCZOS
+                    )
+                    sign_text = pytesseract.image_to_string(
+                        ImageOps.autocontrast(ImageOps.grayscale(sign_crop)),
+                        lang="eng",
+                        config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.+-",
+                    ).strip()
+                    sign_match = re.search(r"([+-])\s*1[.,]5", sign_text)
+                    if sign_match:
+                        runline_signs[box_index - 2] = sign_match.group(1)
                     y1 += int((y2 - y1) * 0.38)
                 source_crop = original.crop((int(original.width * x1), y1,
                                              int(original.width * x2), y2))
@@ -546,6 +575,27 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 debug_parts.append(" -> ".join(attempt_texts))
                 values.append(detected_value)
 
+            # ±1.5市場は必ず反対符号の組なので、片方だけ読めた場合は補完する。
+            if runline_signs[0] and not runline_signs[1]:
+                runline_signs[1] = "+" if runline_signs[0] == "-" else "-"
+            elif runline_signs[1] and not runline_signs[0]:
+                runline_signs[0] = "+" if runline_signs[1] == "-" else "-"
+
+            # 符号が欠落・誤認識した場合は「2点差以上勝率 <= 通常勝率」を使って補正する。
+            if all(value is not None for value in values):
+                ml1, ml2, runline1, runline2 = values
+                p_ml1 = fair_probability(ml1, ml2)
+                p_minus1 = fair_probability(runline1, runline2)
+                valid_minus = [
+                    p_minus1 <= p_ml1 + 0.005,
+                    (1 - p_minus1) <= (1 - p_ml1) + 0.005,
+                ]
+                minus_index = (runline_signs.index("-") if "-" in runline_signs else None)
+                if minus_index is not None and not valid_minus[minus_index] and valid_minus[1 - minus_index]:
+                    runline_signs = ["+", "-"] if minus_index == 0 else ["-", "+"]
+                elif minus_index is None and valid_minus.count(True) == 1:
+                    runline_signs = ["-", "+"] if valid_minus[0] else ["+", "-"]
+
             # 携帯版は貼り付け欄と画像の試合順が異なることがある。
             # 左側を試合単位でOCRし、数字を必ずその2チームへ結び付ける。
             team_texts = []
@@ -578,6 +628,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
 
             mobile_debug.append(
                 " / ".join(debug_parts)
+                + " | SIGNS: " + ", ".join(sign or "?" for sign in runline_signs)
                 + " | TEAMS: " + " -> ".join(team_texts)
                 + " => " + ", ".join(team or "?" for team in block_teams)
             )
@@ -587,7 +638,15 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 if any(block_teams):
                     team1, team2 = block_teams
                     ml1, ml2, runline1, runline2 = values
-                    if ml1 < ml2:
+                    if runline_signs[0] == "-":
+                        two_plus_team = team1 or ""
+                        two_plus_slot = 1
+                        two_plus_pct = fair_probability(runline1, runline2) * 100
+                    elif runline_signs[1] == "-":
+                        two_plus_team = team2 or ""
+                        two_plus_slot = 2
+                        two_plus_pct = fair_probability(runline2, runline1) * 100
+                    elif ml1 < ml2:
                         two_plus_team = team1 or ""
                         two_plus_slot = 1
                         two_plus_pct = fair_probability(runline1, runline2) * 100
@@ -595,11 +654,15 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                         two_plus_team = team2 or ""
                         two_plus_slot = 2
                         two_plus_pct = fair_probability(runline2, runline1) * 100
+                    sign1 = runline_signs[0] or "±"
+                    sign2 = runline_signs[1] or "±"
                     mobile_detected.append({
                         "チーム1": team1 or "", "オッズ1": ml1,
+                        "オッズ1±": f"{sign1}1.5 / {runline1:.3f}",
                         "チーム2": team2 or "", "オッズ2": ml2,
+                        "オッズ2±": f"{sign2}1.5 / {runline2:.3f}",
                         "出しチーム": team1 or "", "ハンデ": "0",
-                        "出し2点差以上(%)": None,
+                        "出し2点差以上(%)": None, "もらい2点差以上(%)": None,
                         "_ocr_2plus_team": two_plus_team,
                         "_ocr_2plus_slot": two_plus_slot,
                         "_ocr_2plus_pct": two_plus_pct,
@@ -649,12 +712,21 @@ def calc_side(p_ml: float, p_hc: float, handicap: float, giver_bet: bool,
     pattern_a = p_hc
     pattern_b = p_ml - p_hc
     pattern_c = 1 - p_ml
+    if handicap <= 1:
+        # 例：0.3出しの1点差勝ち＝7分勝ち。
+        giver_one_run = win_return * (1 - handicap)
+        receiver_one_run = -loss_cost * (1 - handicap)
+    else:
+        # 例：1.8出しの1点差勝ち＝8分負け。受け側は8分勝ち。
+        partial_rate = min(handicap - 1, 1)
+        giver_one_run = -loss_cost * partial_rate
+        receiver_one_run = win_return * partial_rate
     if giver_bet:
         return (pattern_a * win_return
-                + pattern_b * (win_return * (1 - handicap))
+                + pattern_b * giver_one_run
                 - pattern_c * loss_cost)
     return (pattern_c * win_return
-            - pattern_b * (loss_cost * (1 - handicap))
+            + pattern_b * receiver_one_run
             - pattern_a * loss_cost)
 
 
@@ -706,8 +778,11 @@ with tab1:
                             detected, base_rows, ordered_numeric)
                         st.session_state.rows = merged_rows
                         st.session_state.pop("games", None)
-                        hc_count = sum(not pd.isna(row.get("出し2点差以上(%)"))
-                                       for row in merged_rows)
+                        hc_count = sum(
+                            not pd.isna(row.get("出し2点差以上(%)"))
+                            or not pd.isna(row.get("もらい2点差以上(%)"))
+                            for row in merged_rows
+                        )
                         game_count = len(ordered_numeric) or len(detected)
                         st.success(
                             f"{game_count}試合のマネーラインを抽出しました。"
@@ -722,12 +797,18 @@ with tab1:
                 st.text_area("認識された文字", st.session_state.ocr, height=180)
 
     initial = st.session_state.get("rows") or [
-        {"チーム1": "阪神", "オッズ1": 1.467, "チーム2": "広島", "オッズ2": 2.850, "出しチーム": "阪神", "ハンデ": "1.7", "出し2点差以上(%)": 50.5},
-        {"チーム1": "横浜", "オッズ1": 1.769, "チーム2": "ヤクルト", "オッズ2": 2.160, "出しチーム": "横浜", "ハンデ": "0.3", "出し2点差以上(%)": None},
-        {"チーム1": "巨人", "オッズ1": 1.854, "チーム2": "中日", "オッズ2": 2.040, "出しチーム": "巨人", "ハンデ": "0", "出し2点差以上(%)": None},
+        {"チーム1": "阪神", "オッズ1": 1.467, "オッズ1±": "-1.5 / 1.909", "チーム2": "広島", "オッズ2": 2.850, "オッズ2±": "+1.5 / 1.925", "出しチーム": "阪神", "ハンデ": "1.7", "出し2点差以上(%)": 50.5, "もらい2点差以上(%)": None},
+        {"チーム1": "横浜", "オッズ1": 1.769, "オッズ1±": None, "チーム2": "ヤクルト", "オッズ2": 2.160, "オッズ2±": None, "出しチーム": "横浜", "ハンデ": "0.3", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
+        {"チーム1": "巨人", "オッズ1": 1.854, "オッズ1±": None, "チーム2": "中日", "オッズ2": 2.040, "オッズ2±": None, "出しチーム": "巨人", "ハンデ": "0", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
     ]
     st.subheader("対戦カードとオッズ（抽出後に必ず確認）")
-    edited = st.data_editor(pd.DataFrame(initial), num_rows="dynamic", hide_index=True,
+    table_columns = [
+        "チーム1", "オッズ1", "オッズ1±",
+        "チーム2", "オッズ2", "オッズ2±",
+        "出しチーム", "ハンデ", "出し2点差以上(%)", "もらい2点差以上(%)",
+    ]
+    initial_df = pd.DataFrame(initial).reindex(columns=table_columns)
+    edited = st.data_editor(initial_df, num_rows="dynamic", hide_index=True,
                             use_container_width=True, key="games")
 
     if st.button("期待値を計算", type="primary"):
@@ -742,25 +823,38 @@ with tab1:
                 p_2plus = None if pd.isna(raw_2plus) else float(raw_2plus) / 100
                 p1 = fair_probability(o1, o2)
                 pg = p1 if giver == t1 else 1 - p1
+                use_ev_range = False
                 if p_2plus is None:
                     if abs(hcap) < 1e-9:
                         p_2plus = pg
                     else:
-                        st.error(f"{t1} vs {t2}: 『出し2点差以上(%)』を入力してください。")
-                        continue
-                if p_2plus > pg + 0.0001:
+                        use_ev_range = True
+                if p_2plus is not None and p_2plus > pg + 0.0001:
                     st.error(
                         f"{t1} vs {t2}: 2点差以上勝率（{p_2plus:.1%}）が"
                         f"通常勝率（{pg:.1%}）を超えています。画像を再抽出するか数値を確認してください。"
                     )
                     continue
                 for team, is_giver in ((giver, True), (t2 if giver == t1 else t1, False)):
-                    ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost)
-                    rank, stake = classify(ev * 100)
+                    if use_ev_range:
+                        endpoint_evs = [
+                            calc_side(pg, 0.0, hcap, is_giver, win_return, loss_cost),
+                            calc_side(pg, pg, hcap, is_giver, win_return, loss_cost),
+                        ]
+                        ev_low, ev_high = min(endpoint_evs), max(endpoint_evs)
+                        # 未知の2点差確率を都合よく仮定せず、最低EVで判定する。
+                        rank, stake = classify(ev_low * 100)
+                        ev_display = f"{ev_low*100:+.1f}% ～ {ev_high*100:+.1f}%"
+                        calculation_type = "範囲・保守判定"
+                    else:
+                        ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost)
+                        rank, stake = classify(ev * 100)
+                        ev_display = f"{ev*100:+.1f}%"
+                        calculation_type = "通常"
                     results.append({"対戦": f"{t1} vs {t2}", "ベット": team,
                                     "区分": "出し" if is_giver else "もらい",
                                     "ハンデ": display_handicap(hcap), "市場勝率": f"{(pg if is_giver else 1-pg):.1%}",
-                                    "EV": f"{ev*100:+.1f}%", "判定": rank,
+                                    "EV": ev_display, "計算区分": calculation_type, "判定": rank,
                                     "推奨率": f"{stake}%", "推奨額": int(bankroll * stake / 100)})
             except (TypeError, ValueError, KeyError, ZeroDivisionError):
                 st.error(f"入力を確認してください: {dict(row)}")
@@ -784,11 +878,15 @@ with tab2:
 ### 計算の考え方
 
 1. マネーライン両側のオッズを正規化し、出し側の真の勝率 `P_ML` を求めます。
-2. -1.5市場の両側を正規化して求めた「出し側2点差以上の確率」を入力します。
+2. -1.5市場の両側を正規化して「出し側2点差以上の確率」を求めます。
 3. A=`P_HC`、B=`P_ML-P_HC`、C=`1-P_ML` の3パターンへ分解します。
 4. 分勝ち・分負けにも手数料を適用します（7分勝ちなら `92%×0.7=64.4%`）。
+   ハンデ1.8の1点差勝ちは8分負けなので `-98%×0.8=-78.4%`、2点差以上は丸勝ちです。
 5. 引き分けは独立させずCへ含めます。
 6. EV 5%以上＝大3%、3%以上＝中2%、0%超＝小1%、0%以下＝見送りです。
 
-ハンデが0以外の場合、`出し2点差以上(%)`は必須です。
+`出し2点差以上(%)`がない場合は、あり得る最小EV～最大EVを表示します。
+判定と推奨額は、未知の確率を有利に仮定しない「最小EV」を基準にします。
+`もらい2点差以上(%)`は画像市場の確認用です。現在の精算式では出し側が勝てなかった
+ケースの配当が共通なので、出し側2点差以上確率の代用にはしません。
     """)
