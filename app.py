@@ -249,7 +249,9 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
             "TesseractインストーラーでJapaneseを追加してから、アプリを再起動してください。"
         )
     original = Image.open(io.BytesIO(upload.getvalue())).convert("RGB")
-    is_mobile_layout = original.height > original.width * 1.2
+    # 携帯スクリーンショットは縦長だけでなく、上下を切り取るとほぼ正方形になる。
+    # PinnacleのPC版は横長なので、縦横比0.70以上を携帯配置として扱う。
+    is_mobile_layout = original.height / max(original.width, 1) >= 0.70
     scale = max(2, min(4, 1800 // max(original.width, 1)))
     image = original.resize((original.width * scale, original.height * scale), Image.Resampling.LANCZOS)
     image = ImageOps.grayscale(image)
