@@ -686,6 +686,23 @@ def fair_probability(odds_a: float, odds_b: float) -> float:
     return ia / (ia + ib)
 
 
+def parse_runline_input(value) -> tuple[str | None, float | None]:
+    """「-1.5 / 2.390」などの手入力から符号とオッズを取り出す。"""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None, None
+    text = str(value).strip().replace("＋", "+").replace("−", "-").replace("－", "-")
+    sign_match = re.search(r"([+-])\s*1(?:[.,]5)?", text)
+    sign = sign_match.group(1) if sign_match else None
+    decimal_values = re.findall(r"(?<!\d)([1-9](?:[.,]\d{2,3}))(?!\d)", text)
+    odds = float(decimal_values[-1].replace(",", ".")) if decimal_values else None
+    if odds is None:
+        compact = re.findall(r"(?<!\d)([1-9]\d{3})(?!\d)", text)
+        if compact:
+            digits = compact[-1]
+            odds = float(f"{digits[0]}.{digits[1:]}")
+    return sign, odds
+
+
 def profit(rate: float, win_return: float, loss_cost: float) -> float:
     """丸勝ちは92%、丸負けは98%。分勝ち・分負けは表記どおりの率。"""
     if rate >= 0.999:
@@ -704,38 +721,82 @@ def outcome_rate(handicap: float, giver_bet: bool, winner_is_giver: bool, margin
     return giver_rate if giver_bet else -giver_rate
 
 
+SPECIAL_HANDICAP_KEYS = {
+    1.5 + 1 / 6,            # 1半
+    1.3 + 1 / 6,            # 1半3
+    1.5 + 1 / 6 + 0.01,     # 1半5
+    1.7 + 1 / 6,            # 1半7
+    2.0,
+}
+
+
+def _special_handicap_key(handicap: float) -> float | None:
+    return next((key for key in SPECIAL_HANDICAP_KEYS
+                 if abs(handicap - key) < 0.0001), None)
+
+
+def _giver_margin_rate(handicap: float, margin: int) -> float:
+    """出し側の精算率。+1=丸勝ち、-1=丸負け、0=返金。"""
+    special_key = _special_handicap_key(handicap)
+    if special_key is not None:
+        return HANDICAP[special_key][min(margin, 3)]
+    if margin <= 0:
+        return -min(max(handicap, 0), 1)
+    if margin == 1:
+        return (1 - handicap) if handicap <= 1 else -min(handicap - 1, 1)
+    # 通常の小数ハンデは、ユーザー定義により2点差以上で丸勝ち。
+    return 1.0
+
+
+def _settlement_value(rate: float, win_return: float, loss_cost: float) -> float:
+    if rate > 0:
+        return win_return * rate
+    if rate < 0:
+        return loss_cost * rate
+    return 0.0
+
+
+def needs_two_run_split(handicap: float) -> bool:
+    """2点差と3点差以上で精算が変わる特殊ハンデか。"""
+    key = _special_handicap_key(handicap)
+    return key is not None and HANDICAP[key][2] != HANDICAP[key][3]
+
+
 def calc_side(p_ml: float, p_hc: float, handicap: float, giver_bet: bool,
-              win_return: float, loss_cost: float, draw_probability: float = 0.0) -> float:
+              win_return: float, loss_cost: float, draw_probability: float = 0.0,
+              two_run_share: float = 0.5) -> float:
     """A=2点差以上、B=1点差、C=相手勝利、D=引き分け。"""
     if not 0 <= draw_probability < 1:
         raise ValueError("引き分け確率は0%以上100%未満にしてください")
     if not 0 <= p_hc <= p_ml <= 1 - draw_probability:
         raise ValueError("2点差以上の確率は、勝利確率以下にしてください")
-    pattern_a = p_hc
+    if not 0 <= two_run_share <= 1:
+        raise ValueError("2点差勝ちの比率は0%以上100%以下にしてください")
+    pattern_a2 = p_hc * two_run_share
+    pattern_a3 = p_hc - pattern_a2
     pattern_b = p_ml - p_hc
     pattern_c = 1 - p_ml - draw_probability
     pattern_d = draw_probability
-    if handicap <= 1:
-        # 例：0.3出しの1点差勝ち＝7分勝ち。
-        giver_one_run = win_return * (1 - handicap)
-        receiver_one_run = -loss_cost * (1 - handicap)
-    else:
-        # 例：1.8出しの1点差勝ち＝8分負け。受け側は8分勝ち。
-        partial_rate = min(handicap - 1, 1)
-        giver_one_run = -loss_cost * partial_rate
-        receiver_one_run = win_return * partial_rate
-    draw_rate = min(max(handicap, 0), 1)
-    giver_draw = -loss_cost * draw_rate
-    receiver_draw = win_return * draw_rate
-    if giver_bet:
-        return (pattern_a * win_return
-                + pattern_b * giver_one_run
-                - pattern_c * loss_cost
-                + pattern_d * giver_draw)
-    return (pattern_c * win_return
-            + pattern_b * receiver_one_run
-            - pattern_a * loss_cost
-            + pattern_d * receiver_draw)
+    giver_rates = {
+        0: _giver_margin_rate(handicap, 0),
+        1: _giver_margin_rate(handicap, 1),
+        2: _giver_margin_rate(handicap, 2),
+        3: _giver_margin_rate(handicap, 3),
+        "loss": -1.0,
+    }
+    probabilities = (
+        (pattern_d, giver_rates[0]),
+        (pattern_b, giver_rates[1]),
+        (pattern_a2, giver_rates[2]),
+        (pattern_a3, giver_rates[3]),
+        (pattern_c, giver_rates["loss"]),
+    )
+    return sum(
+        probability * _settlement_value(
+            rate if giver_bet else -rate, win_return, loss_cost
+        )
+        for probability, rate in probabilities
+    )
 
 
 def classify(ev_pct: float) -> tuple[str, int]:
@@ -773,7 +834,7 @@ with tab1:
             placeholder="巨人\n18:00\n中日\n\n横浜<03>\n18:00\nヤクルト")
         if st.button("貼り付け内容を表へ反映"):
             st.session_state.rows = parse_other_site(pasted)
-            st.session_state.pop("games", None)
+            st.session_state.games_version = st.session_state.get("games_version", 0) + 1
     with right:
         st.subheader("Pinnacleスクリーンショット")
         upload = st.file_uploader("PNG/JPGを選択", type=["png", "jpg", "jpeg"])
@@ -790,7 +851,7 @@ with tab1:
                         merged_rows = _merge_ocr_rows(
                             detected, base_rows, ordered_numeric)
                         st.session_state.rows = merged_rows
-                        st.session_state.pop("games", None)
+                        st.session_state.games_version = st.session_state.get("games_version", 0) + 1
                         hc_count = sum(
                             not pd.isna(row.get("出し2点差以上(%)"))
                             or not pd.isna(row.get("もらい2点差以上(%)"))
@@ -822,7 +883,84 @@ with tab1:
     ]
     initial_df = pd.DataFrame(initial).reindex(columns=table_columns)
     edited = st.data_editor(initial_df, num_rows="dynamic", hide_index=True,
-                            use_container_width=True, key="games")
+                            use_container_width=True,
+                            key=f"games_{st.session_state.get('games_version', 0)}")
+
+    if st.session_state.get("runline_notice"):
+        st.success(st.session_state.pop("runline_notice"))
+    if st.session_state.get("runline_warning"):
+        st.warning(st.session_state.pop("runline_warning"))
+
+    if st.button("±1.5オッズから2点差以上％を計算"):
+        updated_rows = edited.to_dict("records")
+        calculated_count = 0
+        skipped_matches = []
+        for updated_row in updated_rows:
+            updated_row["出し2点差以上(%)"] = None
+            updated_row["もらい2点差以上(%)"] = None
+            sign1, runline1 = parse_runline_input(updated_row.get("オッズ1±"))
+            sign2, runline2 = parse_runline_input(updated_row.get("オッズ2±"))
+            try:
+                ml1 = float(updated_row["オッズ1"])
+                ml2 = float(updated_row["オッズ2"])
+            except (TypeError, ValueError):
+                skipped_matches.append(
+                    f"{updated_row.get('チーム1', '?')} vs {updated_row.get('チーム2', '?')}"
+                )
+                continue
+            if runline1 is None or runline2 is None:
+                skipped_matches.append(
+                    f"{updated_row.get('チーム1', '?')} vs {updated_row.get('チーム2', '?')}"
+                )
+                continue
+            if sign1 and not sign2:
+                sign2 = "+" if sign1 == "-" else "-"
+            elif sign2 and not sign1:
+                sign1 = "+" if sign2 == "-" else "-"
+
+            p_ml1 = fair_probability(ml1, ml2)
+            p_minus1 = fair_probability(runline1, runline2)
+            valid_minus = [
+                p_minus1 <= p_ml1 + 0.005,
+                (1 - p_minus1) <= (1 - p_ml1) + 0.005,
+            ]
+            minus_index = 0 if sign1 == "-" else (1 if sign2 == "-" else None)
+            if minus_index is not None and not valid_minus[minus_index] and valid_minus[1 - minus_index]:
+                minus_index = 1 - minus_index
+            elif minus_index is None and valid_minus.count(True) == 1:
+                minus_index = 0 if valid_minus[0] else 1
+            if minus_index is None:
+                skipped_matches.append(
+                    f"{updated_row.get('チーム1', '?')} vs {updated_row.get('チーム2', '?')}"
+                )
+                continue
+
+            sign1, sign2 = (("-", "+") if minus_index == 0 else ("+", "-"))
+            updated_row["オッズ1±"] = f"{sign1}1.5 / {runline1:.3f}"
+            updated_row["オッズ2±"] = f"{sign2}1.5 / {runline2:.3f}"
+            two_plus_probability = (
+                fair_probability(runline1, runline2) if minus_index == 0
+                else fair_probability(runline2, runline1)
+            ) * 100
+            minus_team = norm_team(
+                updated_row["チーム1"] if minus_index == 0 else updated_row["チーム2"]
+            )
+            giver = norm_team(updated_row.get("出しチーム", ""))
+            if minus_team == giver:
+                updated_row["出し2点差以上(%)"] = round(two_plus_probability, 2)
+            else:
+                updated_row["もらい2点差以上(%)"] = round(two_plus_probability, 2)
+            calculated_count += 1
+
+        st.session_state.rows = updated_rows
+        st.session_state.runline_notice = f"{calculated_count}試合の2点差以上％を計算しました。"
+        if skipped_matches:
+            st.session_state.runline_warning = (
+                "計算できなかった試合: " + " / ".join(skipped_matches)
+                + "。±1.5の両側オッズを確認してください。"
+            )
+        st.session_state.games_version = st.session_state.get("games_version", 0) + 1
+        st.rerun()
 
     if st.button("期待値を計算", type="primary"):
         results = []
@@ -837,12 +975,14 @@ with tab1:
                 p1 = fair_probability(o1, o2)
                 conditional_pg = p1 if giver == t1 else 1 - p1
                 pg = conditional_pg * (1 - draw_probability)
-                use_ev_range = False
+                missing_2plus = False
                 if p_2plus is None:
                     if abs(hcap) < 1e-9:
                         p_2plus = pg
                     else:
-                        use_ev_range = True
+                        missing_2plus = True
+                split_2plus = needs_two_run_split(hcap)
+                use_ev_range = missing_2plus or split_2plus
                 if p_2plus is not None and p_2plus > pg + 0.0001:
                     st.error(
                         f"{t1} vs {t2}: 2点差以上勝率（{p_2plus:.1%}）が"
@@ -851,17 +991,27 @@ with tab1:
                     continue
                 for team, is_giver in ((giver, True), (t2 if giver == t1 else t1, False)):
                     if use_ev_range:
+                        p_hc_candidates = [0.0, pg] if missing_2plus else [p_2plus]
+                        two_run_candidates = [0.0, 1.0] if split_2plus else [0.5]
                         endpoint_evs = [
-                            calc_side(pg, 0.0, hcap, is_giver, win_return, loss_cost,
-                                      draw_probability),
-                            calc_side(pg, pg, hcap, is_giver, win_return, loss_cost,
-                                      draw_probability),
+                            calc_side(
+                                pg, candidate_p_hc, hcap, is_giver,
+                                win_return, loss_cost, draw_probability,
+                                two_run_share=candidate_two_run,
+                            )
+                            for candidate_p_hc in p_hc_candidates
+                            for candidate_two_run in two_run_candidates
                         ]
                         ev_low, ev_high = min(endpoint_evs), max(endpoint_evs)
                         # 未知の2点差確率を都合よく仮定せず、最低EVで判定する。
                         rank, stake = classify(ev_low * 100)
                         ev_display = f"{ev_low*100:+.1f}% ～ {ev_high*100:+.1f}%"
-                        calculation_type = "範囲・保守判定"
+                        if missing_2plus and split_2plus:
+                            calculation_type = "2点差確率・内訳不明"
+                        elif missing_2plus:
+                            calculation_type = "2点差以上確率なし"
+                        else:
+                            calculation_type = "2点差/3点差内訳不明"
                     else:
                         ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost,
                                        draw_probability)
@@ -909,6 +1059,11 @@ with tab2:
 
 `出し2点差以上(%)`がない場合は、あり得る最小EV～最大EVを表示します。
 判定と推奨額は、未知の確率を有利に仮定しない「最小EV」を基準にします。
+`1半3`は2点差7分勝ち・3点差以上丸勝ち、`1半5`は2点差5分勝ち、
+`1半7`は2点差3分勝ち、`2`は2点差返金として処理します。
+±1.5市場では2点差と3点差以上の内訳が分からないため、これらは正しいEV範囲を表示します。
 `もらい2点差以上(%)`は画像市場の確認用です。現在の精算式では出し側が勝てなかった
 ケースの配当が共通なので、出し側2点差以上確率の代用にはしません。
+表の±1.5オッズを手入力・修正した場合は、
+「±1.5オッズから2点差以上％を計算」ボタンで確率欄を更新できます。
     """)
