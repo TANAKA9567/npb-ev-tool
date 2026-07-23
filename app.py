@@ -705,13 +705,16 @@ def outcome_rate(handicap: float, giver_bet: bool, winner_is_giver: bool, margin
 
 
 def calc_side(p_ml: float, p_hc: float, handicap: float, giver_bet: bool,
-              win_return: float, loss_cost: float) -> float:
-    """新式：A=2点差以上、B=1点差、C=それ以外。引き分けは独立させない。"""
-    if not 0 <= p_hc <= p_ml <= 1:
+              win_return: float, loss_cost: float, draw_probability: float = 0.0) -> float:
+    """A=2点差以上、B=1点差、C=相手勝利、D=引き分け。"""
+    if not 0 <= draw_probability < 1:
+        raise ValueError("引き分け確率は0%以上100%未満にしてください")
+    if not 0 <= p_hc <= p_ml <= 1 - draw_probability:
         raise ValueError("2点差以上の確率は、勝利確率以下にしてください")
     pattern_a = p_hc
     pattern_b = p_ml - p_hc
-    pattern_c = 1 - p_ml
+    pattern_c = 1 - p_ml - draw_probability
+    pattern_d = draw_probability
     if handicap <= 1:
         # 例：0.3出しの1点差勝ち＝7分勝ち。
         giver_one_run = win_return * (1 - handicap)
@@ -721,21 +724,27 @@ def calc_side(p_ml: float, p_hc: float, handicap: float, giver_bet: bool,
         partial_rate = min(handicap - 1, 1)
         giver_one_run = -loss_cost * partial_rate
         receiver_one_run = win_return * partial_rate
+    draw_rate = min(max(handicap, 0), 1)
+    giver_draw = -loss_cost * draw_rate
+    receiver_draw = win_return * draw_rate
     if giver_bet:
         return (pattern_a * win_return
                 + pattern_b * giver_one_run
-                - pattern_c * loss_cost)
+                - pattern_c * loss_cost
+                + pattern_d * giver_draw)
     return (pattern_c * win_return
             + pattern_b * receiver_one_run
-            - pattern_a * loss_cost)
+            - pattern_a * loss_cost
+            + pattern_d * receiver_draw)
 
 
 def classify(ev_pct: float) -> tuple[str, int]:
-    if ev_pct >= 5:
+    # 判定は表示用に丸める前のEVを使用する。
+    if ev_pct >= 8:
         return "大", 3
-    if ev_pct >= 3:
+    if ev_pct >= 4:
         return "中", 2
-    if ev_pct > 0:
+    if ev_pct >= 1.5:
         return "小", 1
     return "見送り", 0
 
@@ -748,8 +757,12 @@ with st.sidebar:
     st.header("計算設定")
     win_return = st.number_input("勝ち利益率 (%)", 0.0, 200.0, 92.0, 1.0) / 100
     loss_cost = st.number_input("負け支払率 (%)", 0.0, 200.0, 98.0, 1.0) / 100
-    st.caption("引き分けは独立計算せず『本命勝利以外』へ含めます。")
-    bankroll = st.number_input("総資金 (円)", 0, value=100000, step=10000)
+    draw_probability = st.number_input(
+        "引き分け確率 (%)", 0.0, 99.0, 5.0, 0.5,
+        help="9回終了時点の引き分け確率です。",
+    ) / 100
+    st.caption("勝敗確率は、引き分けを除いた残りの確率へマネーライン比率で配分します。")
+    bankroll = st.number_input("総資金 (円)", 0, value=1000000, step=10000)
 
 tab1, tab2 = st.tabs(["入力・計算", "計算方法"])
 with tab1:
@@ -822,7 +835,8 @@ with tab1:
                 raw_2plus = row.get("出し2点差以上(%)")
                 p_2plus = None if pd.isna(raw_2plus) else float(raw_2plus) / 100
                 p1 = fair_probability(o1, o2)
-                pg = p1 if giver == t1 else 1 - p1
+                conditional_pg = p1 if giver == t1 else 1 - p1
+                pg = conditional_pg * (1 - draw_probability)
                 use_ev_range = False
                 if p_2plus is None:
                     if abs(hcap) < 1e-9:
@@ -838,8 +852,10 @@ with tab1:
                 for team, is_giver in ((giver, True), (t2 if giver == t1 else t1, False)):
                     if use_ev_range:
                         endpoint_evs = [
-                            calc_side(pg, 0.0, hcap, is_giver, win_return, loss_cost),
-                            calc_side(pg, pg, hcap, is_giver, win_return, loss_cost),
+                            calc_side(pg, 0.0, hcap, is_giver, win_return, loss_cost,
+                                      draw_probability),
+                            calc_side(pg, pg, hcap, is_giver, win_return, loss_cost,
+                                      draw_probability),
                         ]
                         ev_low, ev_high = min(endpoint_evs), max(endpoint_evs)
                         # 未知の2点差確率を都合よく仮定せず、最低EVで判定する。
@@ -847,13 +863,16 @@ with tab1:
                         ev_display = f"{ev_low*100:+.1f}% ～ {ev_high*100:+.1f}%"
                         calculation_type = "範囲・保守判定"
                     else:
-                        ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost)
+                        ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost,
+                                       draw_probability)
                         rank, stake = classify(ev * 100)
                         ev_display = f"{ev*100:+.1f}%"
                         calculation_type = "通常"
                     results.append({"対戦": f"{t1} vs {t2}", "ベット": team,
                                     "区分": "出し" if is_giver else "もらい",
-                                    "ハンデ": display_handicap(hcap), "市場勝率": f"{(pg if is_giver else 1-pg):.1%}",
+                                    "ハンデ": display_handicap(hcap),
+                                    "市場勝率": f"{(pg if is_giver else 1-draw_probability-pg):.1%}",
+                                    "引分確率": f"{draw_probability:.1%}",
                                     "EV": ev_display, "計算区分": calculation_type, "判定": rank,
                                     "推奨率": f"{stake}%", "推奨額": int(bankroll * stake / 100)})
             except (TypeError, ValueError, KeyError, ZeroDivisionError):
@@ -877,13 +896,16 @@ with tab2:
     st.markdown("""
 ### 計算の考え方
 
-1. マネーライン両側のオッズを正規化し、出し側の真の勝率 `P_ML` を求めます。
+1. マネーライン両側のオッズを正規化し、設定した引き分け確率を除いた残りへ
+   両チームの勝率を配分して、出し側の真の勝率 `P_ML` を求めます。
 2. -1.5市場の両側を正規化して「出し側2点差以上の確率」を求めます。
 3. A=`P_HC`、B=`P_ML-P_HC`、C=`1-P_ML` の3パターンへ分解します。
 4. 分勝ち・分負けにも手数料を適用します（7分勝ちなら `92%×0.7=64.4%`）。
    ハンデ1.8の1点差勝ちは8分負けなので `-98%×0.8=-78.4%`、2点差以上は丸勝ちです。
-5. 引き分けは独立させずCへ含めます。
-6. EV 5%以上＝大3%、3%以上＝中2%、0%超＝小1%、0%以下＝見送りです。
+5. 引き分けは独立した確率として計算し、ハンデ0.3なら出し側3分負け・
+   もらい側3分勝ちのように精算します。
+6. EV 8%以上＝大3%、4%以上8%未満＝中2%、1.5%以上4%未満＝小1%、
+   1.5%未満＝見送りです。判定には丸める前のEVを使用します。
 
 `出し2点差以上(%)`がない場合は、あり得る最小EV～最大EVを表示します。
 判定と推奨額は、未知の確率を有利に仮定しない「最小EV」を基準にします。
