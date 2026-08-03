@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import re
 import shutil
 from difflib import SequenceMatcher
@@ -116,6 +117,7 @@ def parse_other_site(text: str) -> list[dict]:
         handicap = a[1] if a[2] else (b[1] if b[2] else 0.0)
         rows.append({"チーム1": a[0], "オッズ1": None, "オッズ1±": None,
                      "チーム2": b[0], "オッズ2": None, "オッズ2±": None,
+                     "合計ライン": None, "オーバー": None, "アンダー": None,
                      "出しチーム": giver, "ハンデ": display_handicap(handicap),
                      "出し2点差以上(%)": None, "もらい2点差以上(%)": None})
     return rows
@@ -183,6 +185,9 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
         else:
             match["オッズ1"], match["オッズ2"] = detected["オッズ2"], detected["オッズ1"]
             match["オッズ1±"], match["オッズ2±"] = detected.get("オッズ2±"), detected.get("オッズ1±")
+        match["合計ライン"] = detected.get("合計ライン")
+        match["オーバー"] = detected.get("オーバー")
+        match["アンダー"] = detected.get("アンダー")
         giver = norm_team(match.get("出しチーム", ""))
         hcap = parse_handicap(str(match.get("ハンデ", "0")))
         favorite_slot = detected.get("_ocr_2plus_slot")
@@ -217,6 +222,9 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
             row["オッズ1"], row["オッズ2"] = values[0], values[1]
             if len(values) >= 4:
                 row["オッズ1±"], row["オッズ2±"] = values[2], values[3]
+            if len(values) >= 7:
+                row["オーバー"], row["アンダー"] = values[4], values[5]
+                row["合計ライン"] = values[6]
             hcap = parse_handicap(str(row.get("ハンデ", "0")))
             if abs(hcap) < 1e-9 or len(values) < 4:
                 continue
@@ -293,7 +301,11 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
     original = Image.open(io.BytesIO(upload.getvalue())).convert("RGB")
     # 携帯スクリーンショットは縦長だけでなく、上下を切り取るとほぼ正方形になる。
     # PinnacleのPC版は横長なので、縦横比0.70以上を携帯配置として扱う。
-    is_mobile_layout = original.height / max(original.width, 1) >= 0.70
+    pre_detected_odds_boxes = detect_mobile_odds_boxes(original)
+    is_mobile_layout = (
+        original.height / max(original.width, 1) >= 0.70
+        or len(pre_detected_odds_boxes) >= 4
+    )
     scale = max(2, min(4, 1800 // max(original.width, 1)))
     image = original.resize((original.width * scale, original.height * scale), Image.Resampling.LANCZOS)
     image = ImageOps.grayscale(image)
@@ -542,7 +554,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
         mobile_rows = []
         mobile_detected = []
         mobile_debug = []
-        detected_odds_boxes = detect_mobile_odds_boxes(original)
+        detected_odds_boxes = pre_detected_odds_boxes
         for top, bottom in zip(filtered_boundaries, filtered_boundaries[1:]):
             if bottom - top < 100:
                 continue
@@ -552,13 +564,19 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 if top <= (box[1] + box[3]) / 2 < bottom
             ]
             box_mode = "DYNAMIC"
-            if len(block_boxes) == 4:
-                # Visual order is ML1, HC1, ML2, HC2. Reorder for the data model.
+            if len(block_boxes) in (4, 6):
+                # 画面の行順を [ML1, ML2, HC1, HC2, Over, Under] へ並べ替える。
                 block_boxes.sort(key=lambda box: ((box[1] + box[3]) / 2,
                                                    (box[0] + box[2]) / 2))
-                boxes = [block_boxes[0], block_boxes[2], block_boxes[1], block_boxes[3]]
+                if len(block_boxes) == 6:
+                    boxes = [block_boxes[0], block_boxes[3], block_boxes[1],
+                             block_boxes[4], block_boxes[2], block_boxes[5]]
+                else:
+                    boxes = [block_boxes[0], block_boxes[2], block_boxes[1], block_boxes[3]]
                 team_crop_right = max(1, min(box[0] for box in block_boxes) - 4)
             else:
+                if detected_odds_boxes:
+                    continue
                 box_mode = f"FALLBACK({len(block_boxes)})"
                 boxes = [
                     (int(original.width * 0.52), top + 20, int(original.width * 0.76), middle),
@@ -569,12 +587,15 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 team_crop_right = int(original.width * 0.53)
             values = []
             runline_signs = [None, None]
+            total_lines = [None, None]
             debug_parts = []
             for box_index, (x1, y1, x2, y2) in enumerate(boxes):
                 # HC欄は上部の「±1.5」を除き、下側のオッズだけ読む。
-                if box_index >= 2:
+                if box_index in (2, 3):
+                    width = x2 - x1
                     sign_crop = original.crop((
-                        x1, y1, x2, y1 + int((y2 - y1) * 0.48),
+                        x1 + int(width * 0.18), y1 + 5,
+                        x2 - int(width * 0.18), y1 + int((y2 - y1) * 0.52),
                     ))
                     sign_crop = sign_crop.resize(
                         (sign_crop.width * 4, sign_crop.height * 4), Image.Resampling.LANCZOS
@@ -582,11 +603,33 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                     sign_text = pytesseract.image_to_string(
                         ImageOps.autocontrast(ImageOps.grayscale(sign_crop)),
                         lang="eng",
-                        config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.+-",
+                        config="--oem 3 --psm 11 -c tessedit_char_whitelist=0123456789.+-",
                     ).strip()
-                    sign_match = re.search(r"([+-])\s*1[.,]5", sign_text)
+                    sign_match = re.search(r"([+-])", sign_text)
                     if sign_match:
                         runline_signs[box_index - 2] = sign_match.group(1)
+                    y1 += int((y2 - y1) * 0.38)
+                elif box_index in (4, 5):
+                    width = x2 - x1
+                    line_crop = original.crop((
+                        x1 + int(width * 0.25), y1 + 8,
+                        x2 - int(width * 0.25), y1 + int((y2 - y1) * 0.48),
+                    ))
+                    line_crop = line_crop.resize(
+                        (line_crop.width * 4, line_crop.height * 4), Image.Resampling.LANCZOS
+                    )
+                    line_text = pytesseract.image_to_string(
+                        ImageOps.autocontrast(ImageOps.grayscale(line_crop)),
+                        lang="eng",
+                        config="--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789.",
+                    ).strip()
+                    compact_line = re.sub(r"\D", "", line_text)
+                    if "." not in line_text and len(compact_line) in (2, 3) and compact_line.endswith("5"):
+                        total_lines[box_index - 4] = float(compact_line) / 10
+                    else:
+                        line_matches = re.findall(r"\d{1,2}(?:[.,]\d)?", line_text)
+                        if line_matches:
+                            total_lines[box_index - 4] = float(line_matches[-1].replace(",", "."))
                     y1 += int((y2 - y1) * 0.38)
                 source_crop = original.crop((x1, y1, x2, y2))
                 enlarged = source_crop.resize((source_crop.width * 3, source_crop.height * 3),
@@ -639,8 +682,8 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 runline_signs[0] = "+" if runline_signs[1] == "-" else "-"
 
             # 符号が欠落・誤認識した場合は「2点差以上勝率 <= 通常勝率」を使って補正する。
-            if all(value is not None for value in values):
-                ml1, ml2, runline1, runline2 = values
+            if len(values) >= 4 and all(value is not None for value in values[:4]):
+                ml1, ml2, runline1, runline2 = values[:4]
                 p_ml1 = fair_probability(ml1, ml2)
                 p_minus1 = fair_probability(runline1, runline2)
                 valid_minus = [
@@ -686,15 +729,19 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
             mobile_debug.append(
                 f"BOXES: {box_mode} / " + " / ".join(debug_parts)
                 + " | SIGNS: " + ", ".join(sign or "?" for sign in runline_signs)
+                + " | TOTAL: " + ", ".join("?" if value is None else f"{value:g}" for value in total_lines)
                 + " | TEAMS: " + " -> ".join(team_texts)
                 + " => " + ", ".join(team or "?" for team in block_teams)
             )
-            if all(value is not None for value in values):
-                # 4分割済みなので共通形式 [ML1, ML2, HC1, HC2] の順。
-                mobile_rows.append(values)
+            if len(values) >= 4 and all(value is not None for value in values[:4]):
+                total_line = next((value for value in total_lines if value is not None), None)
+                normalized_values = values[:4]
+                if len(values) >= 6:
+                    normalized_values += [values[4], values[5], total_line]
+                mobile_rows.append(normalized_values)
                 if any(block_teams):
                     team1, team2 = block_teams
-                    ml1, ml2, runline1, runline2 = values
+                    ml1, ml2, runline1, runline2 = values[:4]
                     if runline_signs[0] == "-":
                         two_plus_team = team1 or ""
                         two_plus_slot = 1
@@ -718,6 +765,9 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                         "オッズ1±": f"{sign1}1.5 / {runline1:.3f}",
                         "チーム2": team2 or "", "オッズ2": ml2,
                         "オッズ2±": f"{sign2}1.5 / {runline2:.3f}",
+                        "合計ライン": total_line,
+                        "オーバー": values[4] if len(values) >= 6 else None,
+                        "アンダー": values[5] if len(values) >= 6 else None,
                         "出しチーム": team1 or "", "ハンデ": "0",
                         "出し2点差以上(%)": None, "もらい2点差以上(%)": None,
                         "_ocr_2plus_team": two_plus_team,
@@ -758,6 +808,153 @@ def parse_runline_input(value) -> tuple[str | None, float | None]:
             digits = compact[-1]
             odds = float(f"{digits[0]}.{digits[1:]}")
     return sign, odds
+
+
+def _poisson_probabilities(mean: float, size: int):
+    import numpy as np
+
+    probabilities = np.empty(size, dtype=float)
+    probabilities[0] = math.exp(-mean)
+    for score in range(1, size):
+        probabilities[score] = probabilities[score - 1] * mean / score
+    return probabilities
+
+
+def _baseline_score_matrix(ml_team1: float, over_probability: float,
+                           total_line: float, size: int = 26):
+    """MLとO/Uから独立ポアソンの基準得点分布を作る。"""
+    import numpy as np
+
+    if abs(total_line * 2 - round(total_line * 2)) > 1e-6 or int(round(total_line * 2)) % 2 == 0:
+        raise ValueError("自動同点率は0.5刻みの合計ラインに対応しています")
+    cutoff = math.floor(total_line)
+
+    def poisson_over(total_mean: float) -> float:
+        term = math.exp(-total_mean)
+        cumulative = term
+        for score in range(1, cutoff + 1):
+            term *= total_mean / score
+            cumulative += term
+        return 1 - cumulative
+
+    low, high = 0.2, 25.0
+    if not poisson_over(low) <= over_probability <= poisson_over(high):
+        raise ValueError("O/U市場から合計得点を推定できません")
+    for _ in range(80):
+        middle = (low + high) / 2
+        if poisson_over(middle) < over_probability:
+            low = middle
+        else:
+            high = middle
+    total_mean = (low + high) / 2
+    scores = np.arange(size)
+
+    def matrix_for_share(team1_share: float):
+        p1 = _poisson_probabilities(total_mean * team1_share, size)
+        p2 = _poisson_probabilities(total_mean * (1 - team1_share), size)
+        matrix = np.outer(p1, p2)
+        return matrix / matrix.sum()
+
+    low, high = 0.05, 0.95
+    for _ in range(80):
+        middle = (low + high) / 2
+        matrix = matrix_for_share(middle)
+        team1_win = matrix[scores[:, None] > scores[None, :]].sum()
+        conditional_win = team1_win / (1 - np.trace(matrix))
+        if conditional_win < ml_team1:
+            low = middle
+        else:
+            high = middle
+    return matrix_for_share((low + high) / 2)
+
+
+def estimate_draw_probability(
+    ml1: float, ml2: float,
+    runline_sign1: str | None, runline1: float,
+    runline_sign2: str | None, runline2: float,
+    total_line: float, over_odds: float, under_odds: float,
+) -> dict:
+    """ML・±1.5・O/Uから同点率を推定し、基準5%へ縮小して1～10%に制限する。"""
+    import numpy as np
+
+    if min(ml1, ml2, runline1, runline2, over_odds, under_odds) <= 1:
+        raise ValueError("すべてのオッズは1より大きい必要があります")
+    ml_team1 = fair_probability(ml1, ml2)
+    over_probability = fair_probability(over_odds, under_odds)
+    if runline_sign1 == "-":
+        minus_index = 0
+        cover_probability = fair_probability(runline1, runline2)
+    elif runline_sign2 == "-":
+        minus_index = 1
+        cover_probability = fair_probability(runline2, runline1)
+    else:
+        raise ValueError("±1.5市場のマイナス側を特定できません")
+
+    base = _baseline_score_matrix(ml_team1, over_probability, total_line)
+    size = base.shape[0]
+    score1, score2 = np.indices((size, size))
+    team1_win = score1 > score2
+    non_draw = score1 != score2
+    cover = ((score1 - score2 >= 2) if minus_index == 0 else (score2 - score1 >= 2))
+    over = score1 + score2 > total_line
+    features = np.column_stack((
+        (team1_win.astype(float) - ml_team1 * non_draw.astype(float)).ravel(),
+        cover.astype(float).ravel(), over.astype(float).ravel(),
+    ))
+    targets = np.array([0.0, cover_probability, over_probability])
+    base_flat = np.maximum(base.ravel(), 1e-300)
+    log_base = np.log(base_flat)
+    theta = np.zeros(3)
+
+    def distribution(parameters):
+        log_weight = log_base + features @ parameters
+        log_weight -= log_weight.max()
+        weights = np.exp(log_weight)
+        return weights / weights.sum()
+
+    converged = False
+    for _ in range(80):
+        q = distribution(theta)
+        expected = q @ features
+        gradient = expected - targets
+        if float(np.max(np.abs(gradient))) < 1e-9:
+            converged = True
+            break
+        centered = features - expected
+        covariance = centered.T @ (centered * q[:, None])
+        step = np.linalg.solve(covariance + np.eye(3) * 1e-10, gradient)
+        current_error = float(gradient @ gradient)
+        for reduction in range(14):
+            candidate = theta - step * (0.5 ** reduction)
+            candidate_q = distribution(candidate)
+            if float(((candidate_q @ features - targets) ** 2).sum()) < current_error:
+                theta = candidate
+                break
+        else:
+            break
+
+    probability = distribution(theta).reshape((size, size))
+    residual = float(np.max(np.abs(probability.ravel() @ features - targets)))
+    if not converged or residual > 0.001:
+        raise ValueError("3市場を整合できません")
+    raw_draw = float(np.trace(probability))
+    q = np.maximum(probability.ravel(), 1e-300)
+    information_distance = float(np.sum(q * np.log(q / base_flat)))
+    if information_distance <= 0.15:
+        confidence, consistency = 0.50, "高"
+    elif information_distance <= 0.50:
+        confidence, consistency = 0.30, "中"
+    else:
+        confidence, consistency = 0.0, "低"
+    adopted_draw = min(0.10, max(0.01, 0.05 + (raw_draw - 0.05) * confidence))
+    reasons = []
+    reasons.append("低得点傾向" if total_line <= 7.5 else "高得点傾向")
+    reasons.append("接戦傾向" if abs(ml_team1 - 0.5) <= 0.08 else "実力差あり")
+    return {
+        "raw": raw_draw, "adopted": adopted_draw,
+        "confidence": confidence, "consistency": consistency,
+        "reason": "・".join(reasons), "information_distance": information_distance,
+    }
 
 
 def profit(rate: float, win_return: float, loss_cost: float) -> float:
@@ -875,11 +1072,12 @@ with st.sidebar:
     st.header("計算設定")
     win_return = st.number_input("勝ち利益率 (%)", 0.0, 200.0, 92.0, 1.0) / 100
     loss_cost = st.number_input("負け支払率 (%)", 0.0, 200.0, 98.0, 1.0) / 100
+    draw_mode = st.radio("引き分け計算", ["3市場から自動推定", "5%固定"])
     draw_probability = st.number_input(
         "引き分け確率 (%)", 0.0, 99.0, 5.0, 0.5,
-        help="9回終了時点の引き分け確率です。",
+        help="5%固定、または自動推定できない試合の予備値です。",
     ) / 100
-    st.caption("勝敗確率は、引き分けを除いた残りの確率へマネーライン比率で配分します。")
+    st.caption("自動推定は基準5%へ補正し、採用値を1～10%に制限します。")
     bankroll = st.number_input("総資金 (円)", 0, value=1000000, step=10000)
 
 tab1, tab2 = st.tabs(["入力・計算", "計算方法"])
@@ -914,10 +1112,17 @@ with tab1:
                             or not pd.isna(row.get("もらい2点差以上(%)"))
                             for row in merged_rows
                         )
+                        totals_count = sum(
+                            not pd.isna(row.get("合計ライン"))
+                            and not pd.isna(row.get("オーバー"))
+                            and not pd.isna(row.get("アンダー"))
+                            for row in merged_rows
+                        )
                         game_count = len(ordered_numeric) or len(detected)
                         st.success(
                             f"{game_count}試合のマネーラインを抽出しました。"
-                            f" うち{hc_count}試合で±1.5市場も認識しました。"
+                            f" うち{hc_count}試合で±1.5市場、"
+                            f"{totals_count}試合でO/U市場も認識しました。"
                         )
                     else:
                         st.error("試合とオッズを組み合わせられませんでした。下のOCR結果を確認してください。")
@@ -928,14 +1133,15 @@ with tab1:
                 st.text_area("認識された文字", st.session_state.ocr, height=180)
 
     initial = st.session_state.get("rows") or [
-        {"チーム1": "阪神", "オッズ1": 1.467, "オッズ1±": "-1.5 / 1.909", "チーム2": "広島", "オッズ2": 2.850, "オッズ2±": "+1.5 / 1.925", "出しチーム": "阪神", "ハンデ": "1.7", "出し2点差以上(%)": 50.5, "もらい2点差以上(%)": None},
-        {"チーム1": "横浜", "オッズ1": 1.769, "オッズ1±": None, "チーム2": "ヤクルト", "オッズ2": 2.160, "オッズ2±": None, "出しチーム": "横浜", "ハンデ": "0.3", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
-        {"チーム1": "巨人", "オッズ1": 1.854, "オッズ1±": None, "チーム2": "中日", "オッズ2": 2.040, "オッズ2±": None, "出しチーム": "巨人", "ハンデ": "0", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
+        {"チーム1": "阪神", "オッズ1": 1.467, "オッズ1±": "-1.5 / 1.909", "チーム2": "広島", "オッズ2": 2.850, "オッズ2±": "+1.5 / 1.925", "合計ライン": None, "オーバー": None, "アンダー": None, "出しチーム": "阪神", "ハンデ": "1.7", "出し2点差以上(%)": 50.5, "もらい2点差以上(%)": None},
+        {"チーム1": "横浜", "オッズ1": 1.769, "オッズ1±": None, "チーム2": "ヤクルト", "オッズ2": 2.160, "オッズ2±": None, "合計ライン": None, "オーバー": None, "アンダー": None, "出しチーム": "横浜", "ハンデ": "0.3", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
+        {"チーム1": "巨人", "オッズ1": 1.854, "オッズ1±": None, "チーム2": "中日", "オッズ2": 2.040, "オッズ2±": None, "合計ライン": None, "オーバー": None, "アンダー": None, "出しチーム": "巨人", "ハンデ": "0", "出し2点差以上(%)": None, "もらい2点差以上(%)": None},
     ]
     st.subheader("対戦カードとオッズ（抽出後に必ず確認）")
     table_columns = [
         "チーム1", "オッズ1", "オッズ1±",
         "チーム2", "オッズ2", "オッズ2±",
+        "合計ライン", "オーバー", "アンダー",
         "出しチーム", "ハンデ", "出し2点差以上(%)", "もらい2点差以上(%)",
     ]
     initial_df = pd.DataFrame(initial).reindex(columns=table_columns)
@@ -1021,17 +1227,45 @@ with tab1:
 
     if st.button("期待値を計算", type="primary"):
         results = []
+        draw_fallbacks = []
         for _, row in edited.iterrows():
             try:
                 t1, t2 = norm_team(row["チーム1"]), norm_team(row["チーム2"])
                 o1, o2 = float(row["オッズ1"]), float(row["オッズ2"])
                 giver = norm_team(row["出しチーム"])
                 hcap = parse_handicap(str(row["ハンデ"]))
+                row_draw = draw_probability
+                draw_raw = None
+                draw_consistency = "固定"
+                draw_reason = "基準値"
+                draw_confidence = 0.0
+                if draw_mode.startswith("3市場"):
+                    try:
+                        sign1, runline1 = parse_runline_input(row.get("オッズ1±"))
+                        sign2, runline2 = parse_runline_input(row.get("オッズ2±"))
+                        if sign1 and not sign2:
+                            sign2 = "+" if sign1 == "-" else "-"
+                        elif sign2 and not sign1:
+                            sign1 = "+" if sign2 == "-" else "-"
+                        if runline1 is None or runline2 is None:
+                            raise ValueError("±1.5オッズ不足")
+                        draw_estimate = estimate_draw_probability(
+                            o1, o2, sign1, runline1, sign2, runline2,
+                            float(row.get("合計ライン")), float(row.get("オーバー")),
+                            float(row.get("アンダー")),
+                        )
+                        row_draw = draw_estimate["adopted"]
+                        draw_raw = draw_estimate["raw"]
+                        draw_consistency = draw_estimate["consistency"]
+                        draw_reason = draw_estimate["reason"]
+                        draw_confidence = draw_estimate["confidence"]
+                    except (TypeError, ValueError, ArithmeticError):
+                        draw_fallbacks.append(f"{t1} vs {t2}")
                 raw_2plus = row.get("出し2点差以上(%)")
                 p_2plus = None if pd.isna(raw_2plus) else float(raw_2plus) / 100
                 p1 = fair_probability(o1, o2)
                 conditional_pg = p1 if giver == t1 else 1 - p1
-                pg = conditional_pg * (1 - draw_probability)
+                pg = conditional_pg * (1 - row_draw)
                 missing_2plus = False
                 if p_2plus is None:
                     if abs(hcap) < 1e-9:
@@ -1053,7 +1287,7 @@ with tab1:
                         endpoint_evs = [
                             calc_side(
                                 pg, candidate_p_hc, hcap, is_giver,
-                                win_return, loss_cost, draw_probability,
+                                win_return, loss_cost, row_draw,
                                 two_run_share=candidate_two_run,
                             )
                             for candidate_p_hc in p_hc_candidates
@@ -1071,20 +1305,30 @@ with tab1:
                             calculation_type = "2点差/3点差内訳不明"
                     else:
                         ev = calc_side(pg, p_2plus, hcap, is_giver, win_return, loss_cost,
-                                       draw_probability)
+                                       row_draw)
                         rank, stake = classify(ev * 100)
                         ev_display = f"{ev*100:+.1f}%"
                         calculation_type = "通常"
                     results.append({"対戦": f"{t1} vs {t2}", "ベット": team,
                                     "区分": "出し" if is_giver else "もらい",
                                     "ハンデ": display_handicap(hcap),
-                                    "市場勝率": f"{(pg if is_giver else 1-draw_probability-pg):.1%}",
-                                    "引分確率": f"{draw_probability:.1%}",
-                                    "EV": ev_display, "計算区分": calculation_type, "判定": rank,
+                                    "市場勝率": f"{(pg if is_giver else 1-row_draw-pg):.1%}",
+                                    "市場推定同点率": "-" if draw_raw is None else f"{draw_raw:.1%}",
+                                    "採用同点率": f"{row_draw:.1%}",
+                                    "市場整合性": draw_consistency,
+                                    "市場反映率": f"{draw_confidence:.0%}",
+                                    "推定根拠": draw_reason,
+                                    "EV": ev_display, "計算区分": calculation_type,
+                                    "判定": rank,
                                     "推奨率": f"{stake}%", "推奨額": int(bankroll * stake / 100)})
             except (TypeError, ValueError, KeyError, ZeroDivisionError):
                 st.error(f"入力を確認してください: {dict(row)}")
         st.session_state.results = pd.DataFrame(results)
+        if draw_fallbacks:
+            st.warning(
+                "3市場の取得不足・不整合により、設定値を使った試合: "
+                + " / ".join(dict.fromkeys(draw_fallbacks))
+            )
         if results:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             pd.DataFrame(results).to_csv(DATA_DIR / f"ev_{stamp}.csv", index=False, encoding="utf-8-sig")
@@ -1107,11 +1351,14 @@ with tab2:
    両チームの勝率を配分して、出し側の真の勝率 `P_ML` を求めます。
 2. -1.5市場の両側を正規化して「出し側2点差以上の確率」を求めます。
 3. A=`P_HC`、B=`P_ML-P_HC`、C=`1-P_ML` の3パターンへ分解します。
-4. 分勝ち・分負けにも手数料を適用します（7分勝ちなら `92%×0.7=64.4%`）。
+4. 自動時はML・±1.5・O/Uを同時に満たす得点分布から市場同点率を推定します。
+   基準5%との差を市場整合性に応じて30%または50%だけ反映し、採用率を1～10%に制限します。
+   整合性が低い、または市場を取得できない場合は設定値（初期値5%）を使います。
+5. 分勝ち・分負けにも手数料を適用します（7分勝ちなら `92%×0.7=64.4%`）。
    ハンデ1.8の1点差勝ちは8分負けなので `-98%×0.8=-78.4%`、2点差以上は丸勝ちです。
-5. 引き分けは独立した確率として計算し、ハンデ0.3なら出し側3分負け・
+6. 引き分けにもハンデ表を適用し、ハンデ0.3なら出し側3分負け・
    もらい側3分勝ちのように精算します。
-6. EV 8%以上＝大3%、4%以上8%未満＝中2%、1.5%以上4%未満＝小1%、
+7. EV 8%以上＝大3%、4%以上8%未満＝中2%、1.5%以上4%未満＝小1%、
    1.5%未満＝見送りです。判定には丸める前のEVを使用します。
 
 `出し2点差以上(%)`がない場合は、あり得る最小EV～最大EVを表示します。
