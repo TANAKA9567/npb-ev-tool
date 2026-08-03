@@ -236,6 +236,48 @@ def _merge_ocr_rows(found: list[dict], existing: list[dict] | None,
     return merged
 
 
+def detect_mobile_odds_boxes(image: Image.Image) -> list[tuple[int, int, int, int]]:
+    """Find Pinnacle's rounded odds cards without relying on fixed coordinates."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+
+    rgb = np.asarray(image.convert("RGB"))
+    height, width = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 80, 180)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for contour in contours:
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        aspect = box_width / max(box_height, 1)
+        if not (0.14 * width <= box_width <= 0.30 * width):
+            continue
+        if not (0.045 * width <= box_height <= 0.18 * width):
+            continue
+        if x <= 0.40 * width or not (1.45 <= aspect <= 2.75):
+            continue
+        candidates.append((x, y, x + box_width, y + box_height))
+
+    # Canny often returns both the inner and outer edge of the same card.
+    # Keep one rectangle for every visual card.
+    candidates.sort(key=lambda box: -((box[2] - box[0]) * (box[3] - box[1])))
+    unique = []
+    tolerance = max(8, int(width * 0.01))
+    for box in candidates:
+        center_x = (box[0] + box[2]) // 2
+        center_y = (box[1] + box[3]) // 2
+        if any(abs(center_x - (old[0] + old[2]) // 2) <= tolerance
+               and abs(center_y - (old[1] + old[3]) // 2) <= tolerance
+               for old in unique):
+            continue
+        unique.append(box)
+    return sorted(unique, key=lambda box: ((box[1] + box[3]) / 2, (box[0] + box[2]) / 2))
+
+
 def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
     """OCR座標からチーム2行と同じ試合帯の左側2オッズを結合する。"""
     import pytesseract
@@ -500,16 +542,31 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
         mobile_rows = []
         mobile_detected = []
         mobile_debug = []
+        detected_odds_boxes = detect_mobile_odds_boxes(original)
         for top, bottom in zip(filtered_boundaries, filtered_boundaries[1:]):
             if bottom - top < 100:
                 continue
             middle = (top + bottom) // 2
-            boxes = [
-                (0.52, top + 20, 0.76, middle),
-                (0.52, middle, 0.76, bottom - 15),
-                (0.76, top + 20, 0.995, middle),
-                (0.76, middle, 0.995, bottom - 15),
+            block_boxes = [
+                box for box in detected_odds_boxes
+                if top <= (box[1] + box[3]) / 2 < bottom
             ]
+            box_mode = "DYNAMIC"
+            if len(block_boxes) == 4:
+                # Visual order is ML1, HC1, ML2, HC2. Reorder for the data model.
+                block_boxes.sort(key=lambda box: ((box[1] + box[3]) / 2,
+                                                   (box[0] + box[2]) / 2))
+                boxes = [block_boxes[0], block_boxes[2], block_boxes[1], block_boxes[3]]
+                team_crop_right = max(1, min(box[0] for box in block_boxes) - 4)
+            else:
+                box_mode = f"FALLBACK({len(block_boxes)})"
+                boxes = [
+                    (int(original.width * 0.52), top + 20, int(original.width * 0.76), middle),
+                    (int(original.width * 0.52), middle, int(original.width * 0.76), bottom - 15),
+                    (int(original.width * 0.76), top + 20, int(original.width * 0.995), middle),
+                    (int(original.width * 0.76), middle, int(original.width * 0.995), bottom - 15),
+                ]
+                team_crop_right = int(original.width * 0.53)
             values = []
             runline_signs = [None, None]
             debug_parts = []
@@ -517,8 +574,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 # HC欄は上部の「±1.5」を除き、下側のオッズだけ読む。
                 if box_index >= 2:
                     sign_crop = original.crop((
-                        int(original.width * x1), y1,
-                        int(original.width * x2), y1 + int((y2 - y1) * 0.48),
+                        x1, y1, x2, y1 + int((y2 - y1) * 0.48),
                     ))
                     sign_crop = sign_crop.resize(
                         (sign_crop.width * 4, sign_crop.height * 4), Image.Resampling.LANCZOS
@@ -532,8 +588,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                     if sign_match:
                         runline_signs[box_index - 2] = sign_match.group(1)
                     y1 += int((y2 - y1) * 0.38)
-                source_crop = original.crop((int(original.width * x1), y1,
-                                             int(original.width * x2), y2))
+                source_crop = original.crop((x1, y1, x2, y2))
                 enlarged = source_crop.resize((source_crop.width * 3, source_crop.height * 3),
                                               Image.Resampling.LANCZOS)
                 gray_crop = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
@@ -561,7 +616,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                         break
                 # 個別OCRでも欠落した場合、全体の座標OCRから同じ枠内の数字を探す。
                 if detected_value is None:
-                    x_low, x_high = original.width * x1 * scale, original.width * x2 * scale
+                    x_low, x_high = x1 * scale, x2 * scale
                     y_low, y_high = y1 * scale, y2 * scale
                     coordinate_hits = [item for item in numeric_odds
                                        if x_low <= item["x"] <= x_high
@@ -608,7 +663,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
             for slot, (start_rate, end_rate) in enumerate(team_bands):
                 y1 = top + int(block_height * start_rate)
                 y2 = top + int(block_height * end_rate)
-                source_team = original.crop((0, y1, int(original.width * 0.53), y2))
+                source_team = original.crop((0, y1, team_crop_right, y2))
                 enlarged_team = source_team.resize(
                     (source_team.width * 3, source_team.height * 3), Image.Resampling.LANCZOS
                 )
@@ -629,7 +684,7 @@ def ocr_moneylines(upload) -> tuple[str, list[dict], list[list[float]]]:
                 team_texts.append(" -> ".join(slot_texts))
 
             mobile_debug.append(
-                " / ".join(debug_parts)
+                f"BOXES: {box_mode} / " + " / ".join(debug_parts)
                 + " | SIGNS: " + ", ".join(sign or "?" for sign in runline_signs)
                 + " | TEAMS: " + " -> ".join(team_texts)
                 + " => " + ", ".join(team or "?" for team in block_teams)
