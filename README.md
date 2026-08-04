@@ -1,38 +1,34 @@
-# NPB スポーツベット期待値ツール
+# NPB期待値ラボ
 
-## 起動方法（VS Code）
+Pinnacleのマネーライン、±1.5、オーバー／アンダーを統合し、9回終了時点の得点分布からハンデ別の期待値を計算するStreamlitアプリです。
 
-VS Codeでこのフォルダーを開き、ターミナルで次を実行します。
+## Streamlit Community Cloudへ公開
+
+1. このフォルダー内のファイルをすべてGitHubリポジトリの最上位へアップロードします。
+2. Streamlit Community Cloudで対象リポジトリと`main`ブランチを選択します。
+3. Main file pathへ`app2.py`を指定します。
+4. Deployを押します。
+
+## ローカル起動
 
 ```powershell
 py -m venv .venv
 .venv\Scripts\Activate.ps1
 py -m pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run app2.py
 ```
 
-ブラウザが自動で開きます。別サイトの文章を貼り付け、Pinnacleのオッズを表で確認・入力してから「期待値を計算」を押してください。
+## 主な機能
 
-## 画像文字認識
-
-画像からの自動抽出には、Pythonパッケージとは別に Tesseract OCR と日本語言語データが必要です。
-利用できない環境では、画像を見ながら表へ直接入力できます。OCR結果は誤ることがあるため、計算前に必ず確認してください。
-
-次のコマンドで `jpn` と `eng` が表示されることを確認してください。
-
-```powershell
-& "C:\Program Files\Tesseract-OCR\tesseract.exe" --list-langs
-```
-
-`jpn` がない場合、Tesseractのインストーラーを再実行し、追加言語の Japanese を選択してください。
+- Pinnacle公開APIからNPBオッズを取得
+- 12球団のチームロゴ表示
+- 出しチームとハンデをプルダウン入力
+- ML・±1.5・O/Uを使った3市場統一得点分布
+- 9回勝率、同点率、点差別確率、EVを計算
+- EVに応じた見送り・小・中・大の資金配分
 
 ## 注意
 
-ハンデ1.3以上では得点差別の確率が必要です。画面左の点差配分は仮定であり、Pinnacleのマネーラインから直接得られる値ではありません。
-Pinnacleのランライン（-1.5）からマージンを除去した「出し側が2点差以上で勝つ確率」が分かる場合は、表の専用列へ入力してください。
-本ツールは計算補助で、利益を保証するものではありません。
-
-## Streamlit Community Cloudで公開
-
-このフォルダー一式をGitHubへ登録し、Streamlit Community Cloudで `app.py` を指定します。
-Python 3.12を推奨します。`packages.txt`により、クラウド側にもTesseractと日本語OCRデータが導入されます。
+- 本ツールは計算補助であり、利益を保証するものではありません。
+- Pinnacle側の仕様変更やアクセス状況により、自動取得できない場合があります。
+- 球団ロゴは各権利者の商標であり、個人利用を前提としています。
